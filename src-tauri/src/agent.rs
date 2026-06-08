@@ -73,6 +73,82 @@ pub fn fetch_status() -> Result<AgentStatus, String> {
     parse_status_json(&raw).map_err(|e| format!("parse status json: {e}"))
 }
 
+/// 与 talon-pilot updater.rs 的 github_asset() 命名保持一致。
+pub fn release_asset_name(os: &str, arch: &str) -> Result<&'static str, String> {
+    match (os, arch) {
+        ("macos", "aarch64") => Ok("tp-agent-macos-arm64.tar.gz"),
+        ("macos", "x86_64") => Ok("tp-agent-macos-x64.tar.gz"),
+        ("linux", "x86_64") => Ok("tp-agent-linux-x64.tar.gz"),
+        ("windows", "x86_64") => Ok("tp-agent-windows-x64.zip"),
+        (o, a) => Err(format!("no prebuilt tp-agent asset for {o}-{a}")),
+    }
+}
+
+pub fn release_download_url(repo: &str, version: Option<&str>, asset: &str) -> String {
+    match version {
+        Some(v) => {
+            let v = v.trim().trim_start_matches('v');
+            format!("https://github.com/{repo}/releases/download/v{v}/{asset}")
+        }
+        None => format!("https://github.com/{repo}/releases/latest/download/{asset}"),
+    }
+}
+
+/// 帮装 tp-agent 到 /usr/local/bin（macOS arm64）。M1 只实现 macOS arm64，其余平台明确报错。
+pub fn install_tp_agent() -> Result<PathBuf, String> {
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    if os != "macos" || arch != "aarch64" {
+        return Err(format!(
+            "M1 only supports macos-aarch64 auto-install; got {os}-{arch}. Install tp-agent manually."
+        ));
+    }
+    let asset = release_asset_name(os, arch)?;
+    let url = release_download_url("darkmice/talon-pilot-client", None, asset);
+
+    let tmp = std::env::temp_dir().join("tp-agent-install");
+    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    let bytes = reqwest::blocking::get(&url)
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.bytes())
+        .map_err(|e| format!("download {url}: {e}"))?;
+
+    // 解 tar.gz，取出 tp-agent 二进制
+    let gz = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut ar = tar::Archive::new(gz);
+    let bin_tmp = tmp.join("tp-agent");
+    let mut found = false;
+    for entry in ar.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+        if path.file_name().and_then(|n| n.to_str()) == Some("tp-agent") {
+            entry.unpack(&bin_tmp).map_err(|e| e.to_string())?;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Err("tp-agent binary not found in release asset".to_string());
+    }
+
+    // chmod 755 + ad-hoc 重签（否则 Gatekeeper 杀进程）
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin_tmp, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    let _ = Command::new("xattr").args(["-c"]).arg(&bin_tmp).status();
+    let sign = Command::new("codesign")
+        .args(["-s", "-", "--force"])
+        .arg(&bin_tmp)
+        .status()
+        .map_err(|e| format!("codesign: {e}"))?;
+    if !sign.success() {
+        return Err("codesign ad-hoc failed".to_string());
+    }
+
+    // 装到 /usr/local/bin（需可写；不可写时报错让用户处理权限）
+    let dest = PathBuf::from("/usr/local/bin/tp-agent");
+    std::fs::copy(&bin_tmp, &dest).map_err(|e| format!("install to {}: {e}", dest.display()))?;
+    Ok(dest)
+}
+
 #[cfg(test)]
 #[path = "agent_test.rs"]
 mod agent_test;

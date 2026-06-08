@@ -1,4 +1,4 @@
-use super::{parse_status_json, AgentStatus};
+use super::{parse_status_json, release_asset_name, release_download_url, AgentStatus};
 
 #[test]
 fn parses_status_json_running_enrolled() {
@@ -25,4 +25,36 @@ fn parses_status_json_not_running() {
 #[test]
 fn parse_status_json_rejects_garbage() {
     assert!(parse_status_json("not json").is_err());
+}
+
+#[test]
+fn macos_arm64_asset_name() {
+    assert_eq!(
+        release_asset_name("macos", "aarch64").unwrap(),
+        "tp-agent-macos-arm64.tar.gz"
+    );
+}
+
+#[test]
+fn unsupported_platform_asset_errs() {
+    assert!(release_asset_name("freebsd", "riscv").is_err());
+}
+
+#[test]
+fn latest_download_url() {
+    let url = release_download_url(
+        "darkmice/talon-pilot-client",
+        None,
+        "tp-agent-macos-arm64.tar.gz",
+    );
+    assert_eq!(
+        url,
+        "https://github.com/darkmice/talon-pilot-client/releases/latest/download/tp-agent-macos-arm64.tar.gz"
+    );
+}
+
+#[test]
+fn versioned_download_url_strips_v_prefix() {
+    let url = release_download_url("r/x", Some("v0.1.2"), "a.tar.gz");
+    assert_eq!(url, "https://github.com/r/x/releases/download/v0.1.2/a.tar.gz");
 }
