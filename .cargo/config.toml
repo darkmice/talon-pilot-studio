@@ -1,0 +1,10 @@
+# 项目级 cargo 源：用 sparse 协议（增量、不排队），覆盖全局的 tuna git index（慢且排队）。
+# 仅影响本项目，不动全局 ~/.cargo/config.toml。
+[source.crates-io]
+replace-with = "tuna-sparse"
+
+[source.tuna-sparse]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+
+[net]
+git-fetch-with-cli = true
