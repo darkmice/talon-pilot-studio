@@ -167,6 +167,85 @@ pub fn login_with_key(api_key: &str) -> Result<AgentStatus, String> {
     fetch_status()
 }
 
+/// tp-agent `login --print-auth-url` 会在 pairing 就绪时往 stdout 打一行
+/// `TP_AUTH_URL=<url>`。从单行里提取 url；非该前缀行返回 None。
+/// 抽成纯函数以便单测（流式读管道时逐行喂进来）。
+pub fn extract_auth_url(line: &str) -> Option<String> {
+    line.strip_prefix("TP_AUTH_URL=")
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// WebView 登录闭环(M1 完整 OAuth,无需用户手抄 api_key):
+/// 1. spawn `tp-agent login --suppress-browser --print-auth-url`(stdout piped)
+/// 2. 流式逐行读 stdout,匹配 `TP_AUTH_URL=` 拿到授权 URL,经 `on_auth_url` 回调交给调用方
+///    (调用方在 Tauri WebView 新窗口打开它)
+/// 3. tp-agent 自己的 loopback callback 完成授权 → pair-poll 取 api_key → self-enroll → 进程退出
+/// 4. 等子进程退出,成功则 `fetch_status()` 返回 enrolled 状态
+///
+/// `on_auth_url` 在拿到 URL 时被调用一次;若进程结束都没打出 URL 则返回 Err。
+pub fn login_with_browser<F>(on_auth_url: F) -> Result<AgentStatus, String>
+where
+    F: FnOnce(String),
+{
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let bin = locate_tp_agent().ok_or_else(|| "tp-agent not installed".to_string())?;
+    let mut child = Command::new(&bin)
+        .args(["login", "--suppress-browser", "--print-auth-url"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn tp-agent login: {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture tp-agent stdout".to_string())?;
+
+    // 流式读 stdout,直到拿到 TP_AUTH_URL= 那行。拿到就开窗,然后继续读完
+    // (子进程会一直输出到 OAuth 完成),最后 wait。
+    let reader = BufReader::new(stdout);
+    let mut auth_url_sent = false;
+    let mut on_auth_url = Some(on_auth_url);
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("read tp-agent stdout: {e}"))?;
+        if !auth_url_sent {
+            if let Some(url) = extract_auth_url(&line) {
+                if let Some(cb) = on_auth_url.take() {
+                    cb(url);
+                }
+                auth_url_sent = true;
+            }
+        }
+    }
+
+    // stdout 关闭(进程即将/已退出),收集退出码 + stderr。
+    let status = child.wait().map_err(|e| format!("wait tp-agent login: {e}"))?;
+    if !auth_url_sent {
+        let mut err = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            use std::io::Read;
+            let _ = se.read_to_string(&mut err);
+        }
+        return Err(format!(
+            "tp-agent login 未输出授权 URL(exit {status}): {}",
+            err.trim()
+        ));
+    }
+    if !status.success() {
+        let mut err = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            use std::io::Read;
+            let _ = se.read_to_string(&mut err);
+        }
+        return Err(format!("tp-agent login failed (exit {status}): {}", err.trim()));
+    }
+
+    fetch_status()
+}
+
 #[cfg(test)]
 #[path = "agent_test.rs"]
 mod agent_test;

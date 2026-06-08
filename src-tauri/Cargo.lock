@@ -3234,6 +3234,7 @@ dependencies = [
  "tar",
  "tauri",
  "tauri-build",
+ "tokio",
  "which",
 ]
 
