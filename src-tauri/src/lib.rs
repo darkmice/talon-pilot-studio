@@ -72,6 +72,66 @@ async fn agent_login_browser(
     result
 }
 
+/// macOS 专用注入:Overlay 标题栏(透明、无原生标题栏)下,web-next 顶部没有可拖区域。
+/// 叠一条固定在顶部的透明拖动条,**手动绑 mousedown 调 Tauri 2 的 startDragging()**
+/// (方案 B,绕过 data-tauri-drag-region 属性机制 + CSS -webkit-app-region 的 macOS
+/// WKWebView 冲突坑;需 capabilities 有 core:window:allow-start-dragging)。
+/// 左上 80px 留给交通灯不绑拖动;双击切最大化。
+///
+/// **顶部避让高度不在这里做** —— 交给 web-next 前端按平台条件化 CSS(见 web-next
+/// 的 titlebar 适配),因为 Windows/Linux 用系统原生标题栏(在窗口外),内容不需避让;
+/// 只有 macOS Overlay 才需要内容下移。本脚本只负责"让那条透明区域能拖窗口"。
+/// Windows/Linux 有原生标题栏可直接拖,不注入本脚本。
+#[cfg(target_os = "macos")]
+const TITLEBAR_DRAG_SCRIPT: &str = r#"
+(function () {
+  var ID = '__tp_titlebar_drag__';
+  var BAR_H = 28;     // 拖动条高度,与前端 macOS 避让 padding 对齐
+  var LIGHTS_W = 80;  // 左上交通灯宽度,这一段不触发拖动
+  function getWin() {
+    try { return window.__TAURI__.window.getCurrentWindow(); } catch (e) { return null; }
+  }
+  function ensure() {
+    if (document.getElementById(ID)) return;
+    if (!document.body) return;
+    var bar = document.createElement('div');
+    bar.id = ID;
+    bar.style.cssText = [
+      'position:fixed','top:0','left:0','right:0','height:' + BAR_H + 'px',
+      'z-index:2147483647','user-select:none','-webkit-user-select:none'
+    ].join(';');
+    bar.addEventListener('mousedown', function (e) {
+      if (e.buttons !== 1) return;            // 仅左键
+      if (e.clientX < LIGHTS_W) return;       // 交通灯区域放行,不抢点击
+      var win = getWin();
+      if (!win) return;
+      if (e.detail === 2) { win.toggleMaximize(); return; }  // 双击切最大化
+      e.preventDefault();
+      win.startDragging();
+    });
+    document.body.appendChild(bar);
+  }
+  function boot() {
+    ensure();
+    try {
+      var obs = new MutationObserver(ensure);
+      obs.observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) {}
+  }
+  // __TAURI__ 由 initialization script 注入,顶层脚本执行时可能还没就绪,轮询等一下
+  if (window.__TAURI__ && window.__TAURI__.window) {
+    boot();
+  } else {
+    var tries = 0;
+    var t = setInterval(function () {
+      if ((window.__TAURI__ && window.__TAURI__.window) || tries++ > 50) {
+        clearInterval(t); boot();
+      }
+    }, 100);
+  }
+})();
+"#;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -81,6 +141,14 @@ pub fn run() {
             agent_login,
             agent_login_browser
         ])
+        .on_page_load(|webview, _payload| {
+            // 拖动条只 macOS 需要(Overlay 透明标题栏无原生可拖区)。
+            // Windows/Linux 用系统原生标题栏,直接可拖,不注入。
+            #[cfg(target_os = "macos")]
+            {
+                let _ = webview.eval(TITLEBAR_DRAG_SCRIPT);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

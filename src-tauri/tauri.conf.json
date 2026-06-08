@@ -8,13 +8,16 @@
     "devUrl": "http://127.0.0.1:5174"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Talon Pilot Studio",
         "width": 1280,
         "height": 800,
         "minWidth": 960,
-        "minHeight": 600
+        "minHeight": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {
