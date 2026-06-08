@@ -187,6 +187,13 @@ pub fn extract_auth_url(line: &str) -> Option<String> {
 ///
 /// `api_base_url` / `web_base_url`:云端地址,运行时由客户端注入(ADR §2.5 C2,不编译死)。
 /// 传 `None` 时回落到 tp-agent 二进制内置默认(本地 dev = localhost,release = 线上)。
+///
+/// 去重语义(用户 2026-06-09 拍板):客户端登录账户 Y == 在云端 OAuth 登录 Y(同一后端),
+/// "登录哪个账户"由 WebView 里的实际授权决定。所以这里带 `--force` **绕过 tp-agent
+/// 「本机有任意 enabled 账号就短路」的本地短路**(否则本机已有别的账号时根本走不到
+/// OAuth、登录 Y 失败)。**不重复注册由云端 self-enroll 的机器幂等保证**:self-enroll
+/// 按 (tenant_id, machine_id) 查已有 edge node,同机器同账户复用同一节点(返回 200、
+/// 不新建),machine_id 在本机持久化稳定。即:授权登 Y → self-enroll 自动按机器去重。
 pub fn login_with_browser<F>(
     api_base_url: Option<&str>,
     web_base_url: Option<&str>,
@@ -200,7 +207,7 @@ where
 
     let bin = locate_tp_agent().ok_or_else(|| "tp-agent not installed".to_string())?;
     let mut cmd = Command::new(&bin);
-    cmd.args(["login", "--suppress-browser", "--print-auth-url"]);
+    cmd.args(["login", "--force", "--suppress-browser", "--print-auth-url"]);
     if let Some(api) = api_base_url {
         cmd.args(["--api-base-url", api]);
     }
