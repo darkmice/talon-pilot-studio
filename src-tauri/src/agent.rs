@@ -149,6 +149,24 @@ pub fn install_tp_agent() -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// 用 api_key 驱动 tp-agent 完成 login + self-enroll（spawn CLI，复用现成逻辑）。
+/// M1 用 `--key` 路线：WebView 内 OAuth 授权拿到 api_key 后交给这里。
+/// 账号以客户端登录为准——`tp-agent login` 会把该账号设为 active（多账号场景见 ADR §3 M1.5）。
+pub fn login_with_key(api_key: &str) -> Result<AgentStatus, String> {
+    let bin = locate_tp_agent().ok_or_else(|| "tp-agent not installed".to_string())?;
+    let out = Command::new(&bin)
+        .args(["login", "--key", api_key])
+        .output()
+        .map_err(|e| format!("spawn tp-agent login: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "tp-agent login failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    fetch_status()
+}
+
 #[cfg(test)]
 #[path = "agent_test.rs"]
 mod agent_test;
