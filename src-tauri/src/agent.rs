@@ -184,7 +184,14 @@ pub fn extract_auth_url(line: &str) -> Option<String> {
 /// 4. 等子进程退出,成功则 `fetch_status()` 返回 enrolled 状态
 ///
 /// `on_auth_url` 在拿到 URL 时被调用一次;若进程结束都没打出 URL 则返回 Err。
-pub fn login_with_browser<F>(on_auth_url: F) -> Result<AgentStatus, String>
+///
+/// `api_base_url` / `web_base_url`:云端地址,运行时由客户端注入(ADR §2.5 C2,不编译死)。
+/// 传 `None` 时回落到 tp-agent 二进制内置默认(本地 dev = localhost,release = 线上)。
+pub fn login_with_browser<F>(
+    api_base_url: Option<&str>,
+    web_base_url: Option<&str>,
+    on_auth_url: F,
+) -> Result<AgentStatus, String>
 where
     F: FnOnce(String),
 {
@@ -192,8 +199,15 @@ where
     use std::process::Stdio;
 
     let bin = locate_tp_agent().ok_or_else(|| "tp-agent not installed".to_string())?;
-    let mut child = Command::new(&bin)
-        .args(["login", "--suppress-browser", "--print-auth-url"])
+    let mut cmd = Command::new(&bin);
+    cmd.args(["login", "--suppress-browser", "--print-auth-url"]);
+    if let Some(api) = api_base_url {
+        cmd.args(["--api-base-url", api]);
+    }
+    if let Some(web) = web_base_url {
+        cmd.args(["--web-base-url", web]);
+    }
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

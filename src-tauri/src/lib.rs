@@ -23,7 +23,11 @@ fn agent_login(api_key: String) -> Result<agent::AgentStatus, String> {
 /// 流式拿到授权 URL 后在新 WebView 窗口打开，tp-agent 自己的 loopback callback 完成授权 +
 /// self-enroll，进程退出后返回 enrolled 状态。无需用户手抄 api_key。
 #[tauri::command]
-async fn agent_login_browser(app: tauri::AppHandle) -> Result<agent::AgentStatus, String> {
+async fn agent_login_browser(
+    app: tauri::AppHandle,
+    api_base_url: Option<String>,
+    web_base_url: Option<String>,
+) -> Result<agent::AgentStatus, String> {
     use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
     // url 从 blocking 线程(流式读 tp-agent stdout)回到 async runtime,在这里开窗。
@@ -32,7 +36,7 @@ async fn agent_login_browser(app: tauri::AppHandle) -> Result<agent::AgentStatus
     // login_with_browser 阻塞(流式读 + wait 子进程,可能数分钟),放 blocking 线程。
     let join = tauri::async_runtime::spawn_blocking(move || {
         let mut url_tx = Some(url_tx);
-        agent::login_with_browser(|url| {
+        agent::login_with_browser(api_base_url.as_deref(), web_base_url.as_deref(), |url| {
             if let Some(tx) = url_tx.take() {
                 let _ = tx.send(url);
             }
