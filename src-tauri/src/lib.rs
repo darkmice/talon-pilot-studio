@@ -159,6 +159,39 @@ pub fn run() {
             agent_login,
             agent_login_browser
         ])
+        .setup(|app| {
+            // 初始窗口尺寸按屏幕自适应:宽高都取屏幕 80%(与屏幕同比例),并居中。
+            // tauri.conf.json 的 1280×800 是静态兜底(读不到屏幕时用)。
+            use tauri::{LogicalPosition, LogicalSize, Manager};
+            if let Some(win) = app.get_webview_window("main") {
+                // 窗口在 config 里 visible:false 启动 —— 先按屏幕算好尺寸+位置,再 show,
+                // 避免先以兜底 1280×800 闪一下再跳到目标尺寸/位置。
+                if let Ok(Some(monitor)) = win.current_monitor() {
+                    // monitor.size()/position() 都是物理像素;按 scale_factor 统一转逻辑
+                    // 像素再算,高分屏(retina scale=2)才不会算出半个屏幕大小/错位。
+                    let scale = monitor.scale_factor();
+                    let screen = monitor.size().to_logical::<f64>(scale);
+                    // 屏幕左上角在「虚拟桌面」中的坐标 —— 多显示器/带 dock 偏移时居中靠它,
+                    // 不能假设原点是 (0,0)(副屏 origin 可能是 1920,0 之类)。
+                    let origin = monitor.position().to_logical::<f64>(scale);
+
+                    // 与屏幕同比例:宽高都取屏幕 80%,窗口形状跟屏幕一致。
+                    let width = (screen.width * 0.8).round().max(960.0);
+                    let height = (screen.height * 0.8).round().max(600.0);
+
+                    // 手动算居中坐标(origin + (屏 - 窗)/2),不依赖 win.center() ——
+                    // center() 在多屏/Overlay 标题栏下有时不按本屏工作区算,会偏。
+                    let x = origin.x + (screen.width - width) / 2.0;
+                    let y = origin.y + (screen.height - height) / 2.0;
+
+                    let _ = win.set_size(LogicalSize::new(width, height));
+                    let _ = win.set_position(LogicalPosition::new(x, y));
+                }
+                // 无论是否拿到 monitor(读不到就用兜底尺寸)都要 show,否则窗口永久隐藏。
+                let _ = win.show();
+            }
+            Ok(())
+        })
         .on_page_load(|webview, _payload| {
             // 注入后端地址给前端(window.__TP_API_BASE__)。地址真相源在壳侧:
             // env > 用户配置(~/.config/talon-pilot-studio/config.toml) > 内置默认。
