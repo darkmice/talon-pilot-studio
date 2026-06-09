@@ -169,6 +169,16 @@ pub fn run() {
             if let Ok(lit) = serde_json::to_string(&api_base) {
                 let _ = webview.eval(&format!("window.__TP_API_BASE__ = {lit};"));
             }
+            // 注入客户端运行环境给前端(window.__TP_CLIENT_INFO__):版本号(编译期 Cargo
+            // 版本)+ OS。前端给每个云端请求带 X-Talon-Client* header,后端按此识别客户端、
+            // 记日志便于排查(哪个版本/什么系统来的请求)。版本来自壳真值,不靠 UA 猜。
+            let client_info = serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "os": std::env::consts::OS,  // macos / windows / linux
+            });
+            if let Ok(lit) = serde_json::to_string(&client_info) {
+                let _ = webview.eval(&format!("window.__TP_CLIENT_INFO__ = {lit};"));
+            }
             // 拖动条只 macOS 需要(Overlay 透明标题栏无原生可拖区)。
             // Windows/Linux 用系统原生标题栏,直接可拖,不注入。
             #[cfg(target_os = "macos")]
