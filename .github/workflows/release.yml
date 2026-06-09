@@ -158,6 +158,14 @@ jobs:
         working-directory: repos/talon-pilot-studio
         run: pnpm install
 
+      # tag 触发时把 tauri.conf.json 的 version 同步成 tag 版本(去掉前导 v)。
+      # updater 靠「已装版本 < latest.json 版本」判断有无更新 —— version 必须跟 tag 走,
+      # 否则装上的包内部永远自报 0.1.0,会被反复判定需更新。node 跨平台改 JSON。
+      - name: Sync version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: repos/talon-pilot-studio
+        run: node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.version=process.env.GITHUB_REF_NAME.replace(/^v/,'');fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');console.log('version =>',c.version);"
+
       - name: Tauri build
         working-directory: repos/talon-pilot-studio
         env:
