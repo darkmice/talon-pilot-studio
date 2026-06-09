@@ -102,6 +102,11 @@ jobs:
       #   apiBaseUrl() 在桌面端读注入值,不依赖编译期 env。
       - name: Build web-next
         working-directory: repos/talon-pilot/web-next
+        # web-next 依赖重(monaco/streamdown/mermaid 等),tsc -b + vite build 在 runner
+        # 默认 node 堆(~2GB)下 OOM(exit 134, "heap out of memory")。macos-14 runner
+        # 内存充足(7GB+),把堆上限提到 6GB。
+        env:
+          NODE_OPTIONS: "--max-old-space-size=6144"
         run: |
           pnpm install --frozen-lockfile
           pnpm build
