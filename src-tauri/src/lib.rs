@@ -44,16 +44,29 @@ async fn agent_login_browser(
     });
 
     // 等授权 URL 就绪 → 开 WebView 窗口加载它(tp-agent loopback callback 会完成闭环)。
+    // 注意:开窗错误**不能立即 ? 早返回** —— 那样会跳过下面的 join.await,泄漏 spawn_blocking
+    // 任务(tp-agent 子进程没人收、跑到 10min 超时)。先记下窗口错误,等 join 收掉任务再决定。
+    let mut window_err: Option<String> = None;
     match url_rx.await {
         Ok(url) => {
-            let parsed = url
-                .parse::<tauri::Url>()
-                .map_err(|e| format!("invalid auth url from tp-agent: {e}"))?;
-            WebviewWindowBuilder::new(&app, "agent-auth", WebviewUrl::External(parsed))
-                .title("Talon Pilot — 登录授权")
-                .inner_size(480.0, 720.0)
-                .build()
-                .map_err(|e| format!("open auth window: {e}"))?;
+            match url.parse::<tauri::Url>() {
+                Ok(parsed) => {
+                    if let Err(e) = WebviewWindowBuilder::new(
+                        &app,
+                        "agent-auth",
+                        WebviewUrl::External(parsed),
+                    )
+                    .title("Talon Pilot — 登录授权")
+                    .inner_size(480.0, 720.0)
+                    .build()
+                    {
+                        window_err = Some(format!("open auth window: {e}"));
+                    }
+                }
+                Err(e) => {
+                    window_err = Some(format!("invalid auth url from tp-agent: {e}"));
+                }
+            }
         }
         Err(_) => {
             // sender 被 drop = login_with_browser 没拿到 URL 就结束了；
@@ -61,7 +74,7 @@ async fn agent_login_browser(
         }
     }
 
-    // 等 login_with_browser 跑完(OAuth 完成 → self-enroll → 进程退出 → fetch_status)。
+    // 无论开窗成功失败,都要 await join 收掉 login 任务(否则子进程泄漏)。
     let result = join.await.map_err(|e| format!("login task join: {e}"))?;
 
     // 登录流程结束,关掉授权窗口(成功失败都关)。
@@ -69,6 +82,10 @@ async fn agent_login_browser(
         let _ = w.close();
     }
 
+    // 开窗本身失败时优先报它(子进程已被 join 收掉,不再泄漏)。
+    if let Some(e) = window_err {
+        return Err(e);
+    }
     result
 }
 
