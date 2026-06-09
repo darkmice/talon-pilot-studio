@@ -1,6 +1,8 @@
-name: Release (macOS, unsigned)
+name: Release (multi-platform, unsigned)
 
 # 发版流水线 —— 打 tag `v*` 触发正式发版;workflow_dispatch 手动跑(测试构建,不传 Release)。
+#
+# 四平台矩阵构建:macOS arm64 / macOS x64 / Windows x64 / Linux x64。
 #
 # 构建链(必须复刻本机 WebstormProjects/ 同级目录结构,因为前端用相对路径跨仓引用):
 #   talon-ui/            (public)  —— @talon-ui/react|tokens 组件库, web-next 用 link:../../talon-ui 引
@@ -10,8 +12,11 @@ name: Release (macOS, unsigned)
 # 三仓 checkout 到 $GITHUB_WORKSPACE/repos/{talon-ui,talon-pilot,talon-pilot-studio},
 # 让相对路径 ../../ 在 repos/ 下成立。
 #
-# 签名:M1 无 Apple Developer 账号 → 产**未签名** .dmg/.app。用户首次打开需右键→打开
-# 绕过 Gatekeeper(或 `xattr -dr com.apple.quarantine`)。签名 + updater 自动更新留后续。
+# 签名:无 Apple / Windows 证书 → 产**未签名**安装包。
+#   - macOS: ad-hoc 自签(tauri.conf signingIdentity "-");首开右键→打开 绕 Gatekeeper
+#   - Windows: 未签名 .msi/.exe;SmartScreen 可能提示,选「仍要运行」
+#   - Linux: .deb / .AppImage 无需签名
+# 签名 + updater 自动更新留后续。
 #
 # 需要的 Secret:
 #   TALON_PILOT_PAT —— fine-grained PAT, 至少对 darkmice/talon-pilot 有 Contents:Read 权限,
@@ -33,10 +38,29 @@ permissions:
 
 jobs:
   build:
-    # macOS 14 = arm64 runner(Apple Silicon),与 M1 目标 macos-aarch64 一致;
-    # codesign / hdiutil(.dmg)都是 macOS 原生工具。
-    runs-on: macos-14
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false # 一个平台挂不连累其它平台
+      matrix:
+        include:
+          # macOS Apple Silicon
+          - label: macos-arm64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+          # macOS Intel(macos-13 是 x86_64 runner)
+          - label: macos-x64
+            runner: macos-13
+            rust_target: x86_64-apple-darwin
+          # Windows x64
+          - label: windows-x64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+          # Linux x64
+          - label: linux-x64
+            runner: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
 
     steps:
       # ── 1. 三仓 checkout 到同级 repos/ 目录 ────────────────────────────
@@ -58,7 +82,19 @@ jobs:
           token: ${{ secrets.TALON_PILOT_PAT }}
           path: repos/talon-pilot
 
-      # ── 2. 工具链 ──────────────────────────────────────────────────────
+      # ── 2. Linux 系统依赖(Tauri/WebKitGTK 必需) ────────────────────────
+      - name: Install Linux deps
+        if: matrix.runner == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # ── 3. 工具链 ──────────────────────────────────────────────────────
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -76,7 +112,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache cargo + tauri target
         uses: actions/cache@v4
@@ -85,78 +121,110 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             repos/talon-pilot-studio/src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('repos/talon-pilot-studio/src-tauri/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ matrix.label }}-cargo-${{ hashFiles('repos/talon-pilot-studio/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ matrix.label }}-cargo-
 
-      # ── 3. 构建 talon-ui 组件库(web-next link 依赖它的 dist) ─────────────
+      # ── 4. 构建 talon-ui 组件库(web-next link 依赖它的 dist) ─────────────
       - name: Build talon-ui
         working-directory: repos/talon-ui
         run: |
           pnpm install --frozen-lockfile
           pnpm build
 
-      # ── 4. 构建 web-next 前端(产 dist,供 tauri 打包) ───────────────────
+      # ── 5. 构建 web-next 前端(产 dist,供 tauri 打包) ───────────────────
       #   link:../../talon-ui 依赖上一步 build 出的 talon-ui dist。
-      #   VITE_PILOT_API_BASE_URL 不在此注入 —— 桌面客户端运行时由壳注入
-      #   window.__TP_API_BASE__(壳 config.rs:resolve_api_base)。CI build 留空即可,
-      #   apiBaseUrl() 在桌面端读注入值,不依赖编译期 env。
+      #   后端地址不在编译期注入 —— 桌面客户端运行时由壳注入 window.__TP_API_BASE__。
+      #   web-next 依赖重(monaco/streamdown/mermaid),默认 ~2GB node 堆会 OOM(exit 134),
+      #   提到 6GB(各平台 runner 内存均充足)。
       - name: Build web-next
         working-directory: repos/talon-pilot/web-next
-        # web-next 依赖重(monaco/streamdown/mermaid 等),tsc -b + vite build 在 runner
-        # 默认 node 堆(~2GB)下 OOM(exit 134, "heap out of memory")。macos-14 runner
-        # 内存充足(7GB+),把堆上限提到 6GB。
         env:
           NODE_OPTIONS: "--max-old-space-size=6144"
         run: |
           pnpm install --frozen-lockfile
           pnpm build
 
-      # ── 5. Tauri 打包(ad-hoc 签名) ─────────────────────────────────────
-      #   读 ../../talon-pilot/web-next/dist(上一步产物)。无 Apple 证书,
-      #   tauri.conf.json 配 bundle.macOS.signingIdentity:"-" 走 ad-hoc 自签
-      #   (codesign -s -),runner keychain 无证书也能签出 .app/.dmg。
-      #   产物仍是未签名/ad-hoc,用户首次打开需右键绕 Gatekeeper。
+      # ── 6. Tauri 打包 ──────────────────────────────────────────────────
+      #   读 ../../talon-pilot/web-next/dist(上一步产物)。
+      #   macOS: ad-hoc 自签(tauri.conf signingIdentity "-");Windows/Linux 无需签名。
       - name: Install Tauri CLI
         working-directory: repos/talon-pilot-studio
         run: pnpm install
 
       - name: Tauri build
         working-directory: repos/talon-pilot-studio
-        run: pnpm tauri build --target aarch64-apple-darwin
+        run: pnpm tauri build --target ${{ matrix.rust_target }}
 
-      # ── 6. 收集产物 ────────────────────────────────────────────────────
-      - name: Collect artifacts
-        id: artifacts
+      # ── 7. 收集产物(各平台 bundle 类型不同) ───────────────────────────
+      #   macOS: .dmg | Windows: .msi/.exe(nsis) | Linux: .deb/.AppImage
+      - name: Collect artifacts (unix)
+        if: matrix.runner != 'windows-latest'
         working-directory: repos/talon-pilot-studio
         run: |
-          BUNDLE=src-tauri/target/aarch64-apple-darwin/release/bundle
-          echo "找到的产物:"
-          find "$BUNDLE" -name "*.dmg" -o -name "*.app" -type d | head
+          BUNDLE="src-tauri/target/${{ matrix.rust_target }}/release/bundle"
           mkdir -p "$GITHUB_WORKSPACE/dist-out"
-          # .dmg 是分发主体
-          find "$BUNDLE/dmg" -name "*.dmg" -exec cp {} "$GITHUB_WORKSPACE/dist-out/" \; 2>/dev/null || true
+          echo "扫描产物 in $BUNDLE:"
+          find "$BUNDLE" \( -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" \) -exec cp {} "$GITHUB_WORKSPACE/dist-out/" \; 2>/dev/null || true
           ls -la "$GITHUB_WORKSPACE/dist-out/"
+
+      - name: Collect artifacts (windows)
+        if: matrix.runner == 'windows-latest'
+        working-directory: repos/talon-pilot-studio
+        shell: pwsh
+        run: |
+          $bundle = "src-tauri/target/${{ matrix.rust_target }}/release/bundle"
+          $out = "$env:GITHUB_WORKSPACE/dist-out"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Get-ChildItem -Path $bundle -Recurse -Include *.msi,*.exe | ForEach-Object { Copy-Item $_.FullName -Destination $out }
+          Get-ChildItem $out
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: talon-pilot-studio-macos-arm64
+          name: talon-pilot-studio-${{ matrix.label }}
           path: dist-out/*
           if-no-files-found: error
 
-      # ── 7. 正式发版(仅 tag 触发)→ 传 GitHub Release ──────────────────
+  # ── 8. 汇总四平台产物 → 一个 GitHub Release(仅 tag 触发) ──────────────
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-dist
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-files
+          find all-dist -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.exe" -o -name "*.deb" -o -name "*.AppImage" \) -exec cp {} release-files/ \;
+          ls -la release-files/
+
       - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist-out/*
+          files: release-files/*
           draft: false
-          prerelease: true # M1 内测:标 prerelease
+          prerelease: true # 内测:标 prerelease
           body: |
-            ## Talon Pilot Studio ${{ github.ref_name }}（macOS arm64，内测）
+            ## Talon Pilot Studio ${{ github.ref_name }}（内测）
 
-            > ⚠️ **未签名构建**。首次打开：右键 App →「打开」，或终端执行
-            > `xattr -dr com.apple.quarantine /Applications/Talon\ Pilot\ Studio.app`
+            你的 AI 数字员工指挥台桌面客户端。下载对应平台安装包：
 
-            - 平台：macOS Apple Silicon (arm64)
-            - 自动更新：暂未启用（需 Apple 签名 + updater，后续版本提供）
+            | 平台 | 文件 |
+            |---|---|
+            | macOS (Apple Silicon) | `*_aarch64.dmg` |
+            | macOS (Intel) | `*_x64.dmg` |
+            | Windows | `*.msi` / `*-setup.exe` |
+            | Linux | `*.deb` / `*.AppImage` |
+
+            > ⚠️ **未签名构建（测试版）**
+            > - **macOS**：首次打开右键 App →「打开」，或 `xattr -dr com.apple.quarantine "/Applications/Talon Pilot Studio.app"`
+            > - **Windows**：SmartScreen 提示时选「更多信息」→「仍要运行」
+            >
+            > 自动更新暂未启用，升级请到 Releases 下载新版覆盖安装。
