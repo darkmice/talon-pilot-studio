@@ -185,14 +185,26 @@ jobs:
         working-directory: repos/talon-pilot-studio
         run: |
           BUNDLE="src-tauri/target/${{ matrix.rust_target }}/release/bundle"
-          mkdir -p "$GITHUB_WORKSPACE/dist-out"
+          OUT="$GITHUB_WORKSPACE/dist-out"
+          mkdir -p "$OUT"
           echo "扫描产物 in $BUNDLE:"
+          # 安装包 / Linux updater 包直接拷(文件名已含 arch 或平台唯一)。
           find "$BUNDLE" \( \
             -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" \
-            -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \
             -o -name "*.AppImage.sig" \
-          \) -exec cp {} "$GITHUB_WORKSPACE/dist-out/" \; 2>/dev/null || true
-          ls -la "$GITHUB_WORKSPACE/dist-out/"
+          \) -exec cp {} "$OUT/" \; 2>/dev/null || true
+          # macOS updater 包 `Talon Pilot Studio.app.tar.gz` 文件名**不含 arch**,arm64/x64
+          # 两个构建同名会在汇总时互相覆盖 → 按 matrix.label 重命名加 arch 区分,
+          # latest.json 生成时据文件名里的 label 分 darwin-aarch64 / darwin-x86_64。
+          while IFS= read -r f; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            case "$base" in
+              *.app.tar.gz.sig) cp "$f" "$OUT/talon-pilot-studio-${{ matrix.label }}.app.tar.gz.sig" ;;
+              *.app.tar.gz)     cp "$f" "$OUT/talon-pilot-studio-${{ matrix.label }}.app.tar.gz" ;;
+            esac
+          done < <(find "$BUNDLE" \( -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \))
+          ls -la "$OUT/"
 
       - name: Collect artifacts (windows)
         if: matrix.runner == 'windows-latest'
@@ -202,7 +214,10 @@ jobs:
           $bundle = "src-tauri/target/${{ matrix.rust_target }}/release/bundle"
           $out = "$env:GITHUB_WORKSPACE/dist-out"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          Get-ChildItem -Path $bundle -Recurse -Include *.msi,*.exe,*.nsis.zip,*.nsis.zip.sig | ForEach-Object { Copy-Item $_.FullName -Destination $out }
+          # Windows updater 不产 .nsis.zip —— 它直接对 NSIS 的 -setup.exe(及 .msi)签名,
+          # 产 *-setup.exe.sig / *.msi.sig。自更新下载的就是 -setup.exe 本体。
+          # 故收 .exe/.msi 安装包 + 其 .sig 签名。
+          Get-ChildItem -Path $bundle -Recurse -Include *.msi,*.exe,*.exe.sig,*.msi.sig | ForEach-Object { Copy-Item $_.FullName -Destination $out }
           Get-ChildItem $out
 
       - name: Upload build artifact
@@ -234,7 +249,7 @@ jobs:
           find all-dist -type f \( \
             -name "*.dmg" -o -name "*.msi" -o -name "*.exe" \
             -o -name "*.deb" -o -name "*.AppImage" \
-            -o -name "*.app.tar.gz" -o -name "*.nsis.zip" \
+            -o -name "*.app.tar.gz" \
             -o -name "*.sig" \
           \) -exec cp {} release-files/ \;
           ls -la release-files/
@@ -270,18 +285,20 @@ jobs:
 
           # 收集存在的平台片段
           declare -a parts=()
-          # macOS arm64 / x64:.app.tar.gz(文件名里带 aarch64 / x64 区分)
-          for f in *.app.tar.gz; do
+          # macOS:collect 步已把 .app.tar.gz 重命名为 talon-pilot-studio-macos-{arm64,x64}.app.tar.gz
+          # (原名不含 arch),据 label 分平台键。
+          for f in talon-pilot-studio-macos-*.app.tar.gz; do
             [ -e "$f" ] || continue
             case "$f" in
-              *aarch64*) key="darwin-aarch64" ;;
-              *x64*|*x86_64*) key="darwin-x86_64" ;;
-              *) key="darwin-aarch64" ;;  # 兜底(单 arch 构建)
+              *macos-arm64*) key="darwin-aarch64" ;;
+              *macos-x64*)   key="darwin-x86_64" ;;
+              *) continue ;;
             esac
             if frag=$(emit "$key" "${f}.sig" "$f"); then parts+=("$frag"); fi
           done
-          # Windows:.nsis.zip
-          for f in *.nsis.zip; do
+          # Windows:NSIS 的 -setup.exe 本体即 updater 包(.sig 是 *-setup.exe.sig)。
+          # 自更新下载 -setup.exe 静默重装。(.msi 也有 .sig,但 NSIS 是 Tauri 默认 updater 目标。)
+          for f in *-setup.exe; do
             [ -e "$f" ] || continue
             if frag=$(emit "windows-x86_64" "${f}.sig" "$f"); then parts+=("$frag"); fi
           done
