@@ -1,4 +1,5 @@
 mod agent;
+mod config;
 
 /// 查询本机 tp-agent 状态（spawn `tp-agent status --json`）。
 #[tauri::command]
@@ -159,6 +160,15 @@ pub fn run() {
             agent_login_browser
         ])
         .on_page_load(|webview, _payload| {
+            // 注入后端地址给前端(window.__TP_API_BASE__)。地址真相源在壳侧:
+            // env > 用户配置(~/.config/talon-pilot-studio/config.toml) > 内置默认。
+            // 前端只读这个注入值、不内置地址(用户要求:支持后续自配云端/内网部署)。
+            // on_page_load(Started)早于页面脚本,前端首个 API 请求前已就位。
+            // serde_json 序列化成 JS 字面量,安全转义防注入。
+            let api_base = config::resolve_api_base();
+            if let Ok(lit) = serde_json::to_string(&api_base) {
+                let _ = webview.eval(&format!("window.__TP_API_BASE__ = {lit};"));
+            }
             // 拖动条只 macOS 需要(Overlay 透明标题栏无原生可拖区)。
             // Windows/Linux 用系统原生标题栏,直接可拖,不注入。
             #[cfg(target_os = "macos")]
