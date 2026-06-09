@@ -45,13 +45,14 @@ jobs:
       fail-fast: false # 一个平台挂不连累其它平台
       matrix:
         include:
-          # macOS Apple Silicon
+          # macOS Apple Silicon(macos-15 = arm64)
           - label: macos-arm64
-            runner: macos-14
+            runner: macos-15
             rust_target: aarch64-apple-darwin
-          # macOS Intel(macos-13 是 x86_64 runner)
+          # macOS Intel(macos-15-intel = 专用 Intel runner,排队比老的 macos-13 短;
+          # 与 talon-bin build-bundle.yml 对齐)
           - label: macos-x64
-            runner: macos-13
+            runner: macos-15-intel
             rust_target: x86_64-apple-darwin
           # Windows x64
           - label: windows-x64
