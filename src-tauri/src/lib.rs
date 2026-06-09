@@ -214,15 +214,96 @@ const TITLEBAR_DRAG_SCRIPT: &str = r#"
 })();
 "#;
 
+/// 检查并(经用户确认后)应用更新。供启动后台调用与手动 `app_check_update` 命令复用。
+///
+/// 流程:updater.check() 拉 endpoint 的 latest.json,与本机版本比对 —— 有新版才弹原生
+/// 确认框;用户同意则 download_and_install(updater 边下边用 pubkey 校验 minisign 签名,
+/// 校验失败直接报错不会装上损坏/被篡改包)+ relaunch 重启完成替换。
+/// 静默策略:无更新 / 检查失败(离线、GitHub 不可达)都不打扰用户,只在控制台留痕。
+async fn check_for_update(app: tauri::AppHandle) {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("[updater] 初始化失败: {e}");
+            return;
+        }
+    };
+
+    let update = match updater.check().await {
+        Ok(Some(update)) => update,
+        Ok(None) => return,           // 已是最新
+        Err(e) => {
+            eprintln!("[updater] 检查更新失败(忽略): {e}");
+            return;
+        }
+    };
+
+    // 有新版本 —— 弹原生确认框(异步,不阻塞)。用户同意才下载安装。
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let current = app.package_info().version.to_string();
+    let new_version = update.version.clone();
+    let notes = update.body.clone().unwrap_or_default();
+    let body = if notes.trim().is_empty() {
+        format!("发现新版本 {new_version}(当前 {current})。是否现在更新?\n更新后应用会自动重启。")
+    } else {
+        format!("发现新版本 {new_version}(当前 {current})。\n\n{notes}\n\n是否现在更新?更新后应用会自动重启。")
+    };
+
+    let app_for_dialog = app.clone();
+    app.dialog()
+        .message(body)
+        .title("Talon Pilot Studio 有可用更新")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "立即更新".to_string(),
+            "稍后".to_string(),
+        ))
+        .show(move |confirmed| {
+            if !confirmed {
+                return;
+            }
+            let app = app_for_dialog.clone();
+            tauri::async_runtime::spawn(async move {
+                match update.download_and_install(|_chunk, _total| {}, || {}).await {
+                    Ok(()) => {
+                        // 安装完成,重启自身让新版本生效(进程级 relaunch)。
+                        use tauri::Manager;
+                        tauri::process::restart(&app.env());
+                    }
+                    Err(e) => {
+                        use tauri_plugin_dialog::DialogExt as _;
+                        app.dialog()
+                            .message(format!("更新失败: {e}"))
+                            .title("更新失败")
+                            .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+                            .blocking_show();
+                    }
+                }
+            });
+        });
+}
+
+/// 手动触发检查更新(设置页/菜单可调)。无更新或失败时静默(同后台策略)。
+#[tauri::command]
+async fn app_check_update(app: tauri::AppHandle) {
+    check_for_update(app).await;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             agent_status,
             agent_install,
             agent_login,
             agent_login_browser,
-            agent_login_cancel
+            agent_login_cancel,
+            app_check_update
         ])
         .setup(|app| {
             // 初始窗口尺寸按屏幕自适应:宽高都取屏幕 80%(与屏幕同比例),并居中。
@@ -255,6 +336,16 @@ pub fn run() {
                 // 无论是否拿到 monitor(读不到就用兜底尺寸)都要 show,否则窗口永久隐藏。
                 let _ = win.show();
             }
+
+            // 启动后台静默检查更新。endpoint(GitHub Release latest.json)+ pubkey 在
+            // tauri.conf.json;updater 用自有 minisign 公钥校验下载包完整性 —— 与 Apple
+            // 代码签名无关,所以无 Apple 证书也能自更新。app 自下载替换自身不打 quarantine
+            // 标记,绕过 Gatekeeper 重校(只有首次浏览器下载才会被拦)。
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                check_for_update(handle).await;
+            });
+
             Ok(())
         })
         .on_page_load(|webview, _payload| {

@@ -16,11 +16,17 @@ name: Release (multi-platform, unsigned)
 #   - macOS: ad-hoc 自签(tauri.conf signingIdentity "-");首开右键→打开 绕 Gatekeeper
 #   - Windows: 未签名 .msi/.exe;SmartScreen 可能提示,选「仍要运行」
 #   - Linux: .deb / .AppImage 无需签名
-# 签名 + updater 自动更新留后续。
+#
+# 自动更新(无 Apple 证书也可用):updater 用**自有 minisign 密钥**校验更新包完整性,
+# 与 Apple 代码签名是两码事。app 自下载替换自身不打 quarantine 标记 → 绕过 Gatekeeper
+# 重校(只首次浏览器下载会被拦)。build 时注入 TAURI_SIGNING_PRIVATE_KEY 产 .sig,
+# release job 据 .sig 生成 latest.json,客户端启动时拉 endpoint 比对版本。
 #
 # 需要的 Secret:
-#   TALON_PILOT_PAT —— fine-grained PAT, 至少对 darkmice/talon-pilot 有 Contents:Read 权限,
-#                      用来 checkout private 的 talon-pilot 仓(web-next 前端源)。
+#   TALON_PILOT_PAT          —— fine-grained PAT, 对 darkmice/talon-pilot 有 Contents:Read,
+#                               用来 checkout private 的 talon-pilot 仓(web-next 前端源)。
+#   TAURI_SIGNING_PRIVATE_KEY —— `tauri signer generate` 生成的 minisign 私钥(无密码),
+#                               公钥已写进 tauri.conf.json plugins.updater.pubkey。
 
 on:
   push:
@@ -154,10 +160,18 @@ jobs:
 
       - name: Tauri build
         working-directory: repos/talon-pilot-studio
+        env:
+          # updater 签名私钥(自有 minisign,与 Apple 证书无关)。设置后 tauri build 会
+          # 额外产 updater 包(macOS .app.tar.gz / Windows .nsis.zip / Linux .AppImage)
+          # 及其 .sig 签名文件;app 自更新时用 tauri.conf pubkey 校验这些 .sig。
+          # 私钥无密码生成,故不需要 TAURI_SIGNING_PRIVATE_KEY_PASSWORD。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: pnpm tauri build --target ${{ matrix.rust_target }}
 
       # ── 7. 收集产物(各平台 bundle 类型不同) ───────────────────────────
       #   macOS: .dmg | Windows: .msi/.exe(nsis) | Linux: .deb/.AppImage
+      #   除安装包外,一并收 updater 包(.app.tar.gz / .AppImage)及其 .sig 签名 ——
+      #   release job 据 .sig 生成 latest.json,自更新流程靠它。
       - name: Collect artifacts (unix)
         if: matrix.runner != 'windows-latest'
         working-directory: repos/talon-pilot-studio
@@ -165,7 +179,11 @@ jobs:
           BUNDLE="src-tauri/target/${{ matrix.rust_target }}/release/bundle"
           mkdir -p "$GITHUB_WORKSPACE/dist-out"
           echo "扫描产物 in $BUNDLE:"
-          find "$BUNDLE" \( -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" \) -exec cp {} "$GITHUB_WORKSPACE/dist-out/" \; 2>/dev/null || true
+          find "$BUNDLE" \( \
+            -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" \
+            -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \
+            -o -name "*.AppImage.sig" \
+          \) -exec cp {} "$GITHUB_WORKSPACE/dist-out/" \; 2>/dev/null || true
           ls -la "$GITHUB_WORKSPACE/dist-out/"
 
       - name: Collect artifacts (windows)
@@ -176,7 +194,7 @@ jobs:
           $bundle = "src-tauri/target/${{ matrix.rust_target }}/release/bundle"
           $out = "$env:GITHUB_WORKSPACE/dist-out"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          Get-ChildItem -Path $bundle -Recurse -Include *.msi,*.exe | ForEach-Object { Copy-Item $_.FullName -Destination $out }
+          Get-ChildItem -Path $bundle -Recurse -Include *.msi,*.exe,*.nsis.zip,*.nsis.zip.sig | ForEach-Object { Copy-Item $_.FullName -Destination $out }
           Get-ChildItem $out
 
       - name: Upload build artifact
@@ -203,8 +221,89 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release-files
-          find all-dist -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.exe" -o -name "*.deb" -o -name "*.AppImage" \) -exec cp {} release-files/ \;
+          # 安装包 + updater 包 + .sig 全收进 release(updater 包供自更新下载,
+          # .dmg/.msi 等供首次手装)。
+          find all-dist -type f \( \
+            -name "*.dmg" -o -name "*.msi" -o -name "*.exe" \
+            -o -name "*.deb" -o -name "*.AppImage" \
+            -o -name "*.app.tar.gz" -o -name "*.nsis.zip" \
+            -o -name "*.sig" \
+          \) -exec cp {} release-files/ \;
           ls -la release-files/
+
+      # latest.json —— updater endpoint 拉它比对版本。platforms 键 = {os}-{arch}
+      # (darwin-aarch64 / darwin-x86_64 / windows-x86_64 / linux-x86_64),每项含:
+      #   signature: 对应 updater 包的 .sig 内容(minisign)
+      #   url:       该 updater 包在本 Release 的下载直链
+      # 用 latest/download/<文件名> 直链 —— /latest/ 永远指最新 release,endpoint 固定。
+      - name: Generate latest.json
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+          # tag 形如 v0.1.5 → 版本号 0.1.5(去掉前导 v)
+          VER="${VERSION#v}"
+          BASE="https://github.com/${REPO}/releases/latest/download"
+          cd release-files
+
+          # 给定 .sig 文件名 + 目标 url,输出一个 platform JSON 片段(无尾逗号)
+          emit() {  # $1=platform key  $2=sig file  $3=bundle file name
+            local key="$1" sig="$2" file="$3"
+            if [ -f "$sig" ] && [ -f "$file" ]; then
+              local signature
+              signature=$(cat "$sig")
+              printf '    "%s": { "signature": %s, "url": "%s/%s" }' \
+                "$key" "$(printf '%s' "$signature" | jq -Rs .)" "$BASE" "$file"
+              return 0
+            fi
+            return 1
+          }
+
+          # 收集存在的平台片段
+          declare -a parts=()
+          # macOS arm64 / x64:.app.tar.gz(文件名里带 aarch64 / x64 区分)
+          for f in *.app.tar.gz; do
+            [ -e "$f" ] || continue
+            case "$f" in
+              *aarch64*) key="darwin-aarch64" ;;
+              *x64*|*x86_64*) key="darwin-x86_64" ;;
+              *) key="darwin-aarch64" ;;  # 兜底(单 arch 构建)
+            esac
+            if frag=$(emit "$key" "${f}.sig" "$f"); then parts+=("$frag"); fi
+          done
+          # Windows:.nsis.zip
+          for f in *.nsis.zip; do
+            [ -e "$f" ] || continue
+            if frag=$(emit "windows-x86_64" "${f}.sig" "$f"); then parts+=("$frag"); fi
+          done
+          # Linux:.AppImage
+          for f in *.AppImage; do
+            [ -e "$f" ] || continue
+            if frag=$(emit "linux-x86_64" "${f}.sig" "$f"); then parts+=("$frag"); fi
+          done
+
+          if [ ${#parts[@]} -eq 0 ]; then
+            echo "::error::没收集到任何 updater .sig — 检查 TAURI_SIGNING_PRIVATE_KEY 是否配置 / 构建是否产 .sig"
+            exit 1
+          fi
+
+          PLATFORMS=$(IFS=$',\n'; echo "${parts[*]}")
+          PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > latest.json <<EOF
+          {
+            "version": "${VER}",
+            "notes": "Talon Pilot Studio ${VERSION} — 详见 Release 说明。",
+            "pub_date": "${PUB_DATE}",
+            "platforms": {
+          ${PLATFORMS}
+            }
+          }
+          EOF
+          echo "=== latest.json ==="
+          cat latest.json
+          # 校验 JSON 合法
+          jq . latest.json > /dev/null
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -228,4 +327,4 @@ jobs:
             > - **macOS**：首次打开右键 App →「打开」，或 `xattr -dr com.apple.quarantine "/Applications/Talon Pilot Studio.app"`
             > - **Windows**：SmartScreen 提示时选「更多信息」→「仍要运行」
             >
-            > 自动更新暂未启用，升级请到 Releases 下载新版覆盖安装。
+            > **自动更新已启用**：装好后续版本会在启动时检测，弹窗确认即自动下载升级（无需手动重下）。

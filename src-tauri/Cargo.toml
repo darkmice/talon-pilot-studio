@@ -14,6 +14,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# 自动更新:updater 校验下载包的 minisign 签名(自有密钥,跟 Apple 证书无关),
+# 整套检查/下载/安装在 Rust 侧跑(不耦合共享前端 web-next);dialog 弹原生确认框,
+# process 在用户同意后 relaunch 重启自身完成替换。endpoint/pubkey 在 tauri.conf.json。
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 which = "6"
