@@ -94,10 +94,16 @@ pub fn release_download_url(repo: &str, version: Option<&str>, asset: &str) -> S
     }
 }
 
-/// 帮装 tp-agent 到 /usr/local/bin（macOS arm64）。M1 只实现 macOS arm64，其余平台明确报错。
+/// 帮装 tp-agent 到 /usr/local/bin（macOS arm64）。M1 只实现 macOS arm64。
+///
+/// 实现按 target_os 分叉:macOS 走真实帮装(含 chmod/codesign 等 unix-only 调用);
+/// 非 macOS 是 stub 直接返回「请手动安装」—— **必须 cfg 分叉而非运行时 if**,因为
+/// `std::os::unix::fs::PermissionsExt::from_mode` / `/usr/local/bin` 这些 unix-only
+/// 代码在 Windows 上**编译期**就过不了(E0433 cannot find `unix`,E0599 no from_mode)。
+#[cfg(target_os = "macos")]
 pub fn install_tp_agent() -> Result<PathBuf, String> {
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    if os != "macos" || arch != "aarch64" {
+    if arch != "aarch64" {
         return Err(format!(
             "M1 only supports macos-aarch64 auto-install; got {os}-{arch}. Install tp-agent manually."
         ));
@@ -147,6 +153,15 @@ pub fn install_tp_agent() -> Result<PathBuf, String> {
     let dest = PathBuf::from("/usr/local/bin/tp-agent");
     std::fs::copy(&bin_tmp, &dest).map_err(|e| format!("install to {}: {e}", dest.display()))?;
     Ok(dest)
+}
+
+/// 非 macOS 平台:M1 不做自动帮装,提示手动安装(Windows/Linux 帮装属后续)。
+#[cfg(not(target_os = "macos"))]
+pub fn install_tp_agent() -> Result<PathBuf, String> {
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    Err(format!(
+        "M1 only supports macos-aarch64 auto-install; got {os}-{arch}. Install tp-agent manually."
+    ))
 }
 
 /// 用 api_key 驱动 tp-agent 完成 login + self-enroll（spawn CLI，复用现成逻辑）。
