@@ -111,9 +111,11 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
-      # ── 5. Tauri 打包(未签名) ──────────────────────────────────────────
-      #   读 ../../talon-pilot/web-next/dist(上一步产物)。无签名身份,
-      #   tauri 默认 ad-hoc 或不签;产 .dmg + .app。
+      # ── 5. Tauri 打包(ad-hoc 签名) ─────────────────────────────────────
+      #   读 ../../talon-pilot/web-next/dist(上一步产物)。无 Apple 证书,
+      #   tauri.conf.json 配 bundle.macOS.signingIdentity:"-" 走 ad-hoc 自签
+      #   (codesign -s -),runner keychain 无证书也能签出 .app/.dmg。
+      #   产物仍是未签名/ad-hoc,用户首次打开需右键绕 Gatekeeper。
       - name: Install Tauri CLI
         working-directory: repos/talon-pilot-studio
         run: pnpm install
@@ -121,10 +123,6 @@ jobs:
       - name: Tauri build
         working-directory: repos/talon-pilot-studio
         run: pnpm tauri build --target aarch64-apple-darwin
-        env:
-          # 无 Apple 签名:显式置空,避免 tauri 找不到证书报错。
-          APPLE_CERTIFICATE: ""
-          APPLE_SIGNING_IDENTITY: ""
 
       # ── 6. 收集产物 ────────────────────────────────────────────────────
       - name: Collect artifacts
