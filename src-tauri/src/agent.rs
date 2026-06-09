@@ -94,21 +94,114 @@ pub fn release_download_url(repo: &str, version: Option<&str>, asset: &str) -> S
     }
 }
 
-/// 帮装 tp-agent 到 /usr/local/bin（macOS arm64）。M1 只实现 macOS arm64。
+/// 可执行文件名(Windows 带 .exe)。
+fn tp_agent_bin_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "tp-agent.exe"
+    } else {
+        "tp-agent"
+    }
+}
+
+/// 候选安装目录(按优先级)。优先系统级公共目录(在 PATH 上、tp-agent 自身能找到),
+/// 不可写时回退到用户级目录,避免一上来就要 sudo / 管理员权限失败。
+/// 各候选末项一定是用户级、当前用户必可写的目录,保证总能装上。
+fn install_dir_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: 用户级 %LOCALAPPDATA%\Programs\tp-agent(无需管理员)。
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(local).join("Programs").join("tp-agent"));
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            dirs.push(PathBuf::from(home).join(".tp-agent").join("bin"));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // unix: 先试系统级 /usr/local/bin(常在 PATH),不可写回退 ~/.local/bin。
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join(".local").join("bin"));
+        }
+    }
+    dirs
+}
+
+/// 把临时目录里的 tp-agent 二进制装到首个可写候选目录,返回最终路径。
+/// 逐个候选试:创建目录 + copy,成功即返回;全失败汇总错误(含手动安装提示)。
+fn install_binary(bin_tmp: &std::path::Path) -> Result<PathBuf, String> {
+    let name = tp_agent_bin_name();
+    let mut errs = Vec::new();
+    for dir in install_dir_candidates() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            errs.push(format!("{}: 创建目录失败 {e}", dir.display()));
+            continue;
+        }
+        let dest = dir.join(name);
+        match std::fs::copy(bin_tmp, &dest) {
+            Ok(_) => return Ok(dest),
+            Err(e) => errs.push(format!("{}: 写入失败 {e}", dest.display())),
+        }
+    }
+    Err(format!(
+        "无法安装 tp-agent(已尝试 {} 个目录均失败):\n{}\n可手动下载并放到 PATH 目录。",
+        errs.len(),
+        errs.join("\n")
+    ))
+}
+
+/// 从 tar.gz 字节里取出 tp-agent 二进制到 bin_tmp(macOS / Linux)。
+#[cfg(not(target_os = "windows"))]
+fn extract_tp_agent(bytes: &[u8], bin_tmp: &std::path::Path) -> Result<(), String> {
+    let gz = flate2::read::GzDecoder::new(bytes);
+    let mut ar = tar::Archive::new(gz);
+    for entry in ar.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+        if path.file_name().and_then(|n| n.to_str()) == Some("tp-agent") {
+            entry.unpack(bin_tmp).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+    Err("tp-agent binary not found in release asset".to_string())
+}
+
+/// 从 zip 字节里取出 tp-agent.exe 到 bin_tmp(Windows)。
+#[cfg(target_os = "windows")]
+fn extract_tp_agent(bytes: &[u8], bin_tmp: &std::path::Path) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let reader = std::io::Cursor::new(bytes);
+    let mut zip = zip::ZipArchive::new(reader).map_err(|e| format!("open zip: {e}"))?;
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
+        let fname = std::path::Path::new(f.name())
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        if fname.as_deref() == Some("tp-agent.exe") || fname.as_deref() == Some("tp-agent") {
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+            let mut out = std::fs::File::create(bin_tmp).map_err(|e| e.to_string())?;
+            out.write_all(&buf).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+    Err("tp-agent binary not found in release asset".to_string())
+}
+
+/// 帮装 tp-agent —— 跨平台(macOS arm64/x64 + Linux x64 + Windows x64)。
 ///
-/// 实现按 target_os 分叉:macOS 走真实帮装(含 chmod/codesign 等 unix-only 调用);
-/// 非 macOS 是 stub 直接返回「请手动安装」—— **必须 cfg 分叉而非运行时 if**,因为
-/// `std::os::unix::fs::PermissionsExt::from_mode` / `/usr/local/bin` 这些 unix-only
-/// 代码在 Windows 上**编译期**就过不了(E0433 cannot find `unix`,E0599 no from_mode)。
-#[cfg(target_os = "macos")]
+/// 流程:解析平台 asset → 下载 → 解包(tar.gz / zip)→ 平台后处理(unix chmod;
+/// macOS 额外 ad-hoc codesign 绕 Gatekeeper)→ 装到首个可写目录(系统级优先,
+/// 不可写回退用户级)。不支持的平台/架构返回带具体平台信息的清晰错误。
 pub fn install_tp_agent() -> Result<PathBuf, String> {
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    if arch != "aarch64" {
-        return Err(format!(
-            "M1 only supports macos-aarch64 auto-install; got {os}-{arch}. Install tp-agent manually."
-        ));
-    }
-    let asset = release_asset_name(os, arch)?;
+    // 仅四个预编译组合有 release 资产;其余(如 macOS 之外的 arm64、32 位)无包。
+    let asset = release_asset_name(os, arch).map_err(|_| {
+        format!("暂无 {os}-{arch} 的 tp-agent 预编译包,请手动安装 tp-agent。")
+    })?;
     let url = release_download_url("darkmice/talon-pilot-client", None, asset);
 
     let tmp = std::env::temp_dir().join("tp-agent-install");
@@ -116,52 +209,34 @@ pub fn install_tp_agent() -> Result<PathBuf, String> {
     let bytes = reqwest::blocking::get(&url)
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.bytes())
-        .map_err(|e| format!("download {url}: {e}"))?;
+        .map_err(|e| format!("下载 {url} 失败: {e}"))?;
 
-    // 解 tar.gz，取出 tp-agent 二进制
-    let gz = flate2::read::GzDecoder::new(&bytes[..]);
-    let mut ar = tar::Archive::new(gz);
-    let bin_tmp = tmp.join("tp-agent");
-    let mut found = false;
-    for entry in ar.entries().map_err(|e| e.to_string())? {
-        let mut entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
-        if path.file_name().and_then(|n| n.to_str()) == Some("tp-agent") {
-            entry.unpack(&bin_tmp).map_err(|e| e.to_string())?;
-            found = true;
-            break;
+    let bin_tmp = tmp.join(tp_agent_bin_name());
+    extract_tp_agent(&bytes, &bin_tmp)?;
+
+    // unix: chmod 755(可执行位)。Windows 无此概念。
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin_tmp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+
+    // macOS: 去隔离属性 + ad-hoc 重签,否则下载来的二进制被 Gatekeeper 杀。
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("xattr").args(["-c"]).arg(&bin_tmp).status();
+        let sign = Command::new("codesign")
+            .args(["-s", "-", "--force"])
+            .arg(&bin_tmp)
+            .status()
+            .map_err(|e| format!("codesign: {e}"))?;
+        if !sign.success() {
+            return Err("codesign ad-hoc 签名失败".to_string());
         }
     }
-    if !found {
-        return Err("tp-agent binary not found in release asset".to_string());
-    }
 
-    // chmod 755 + ad-hoc 重签（否则 Gatekeeper 杀进程）
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin_tmp, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
-    let _ = Command::new("xattr").args(["-c"]).arg(&bin_tmp).status();
-    let sign = Command::new("codesign")
-        .args(["-s", "-", "--force"])
-        .arg(&bin_tmp)
-        .status()
-        .map_err(|e| format!("codesign: {e}"))?;
-    if !sign.success() {
-        return Err("codesign ad-hoc failed".to_string());
-    }
-
-    // 装到 /usr/local/bin（需可写；不可写时报错让用户处理权限）
-    let dest = PathBuf::from("/usr/local/bin/tp-agent");
-    std::fs::copy(&bin_tmp, &dest).map_err(|e| format!("install to {}: {e}", dest.display()))?;
-    Ok(dest)
-}
-
-/// 非 macOS 平台:M1 不做自动帮装,提示手动安装(Windows/Linux 帮装属后续)。
-#[cfg(not(target_os = "macos"))]
-pub fn install_tp_agent() -> Result<PathBuf, String> {
-    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    Err(format!(
-        "M1 only supports macos-aarch64 auto-install; got {os}-{arch}. Install tp-agent manually."
-    ))
+    install_binary(&bin_tmp)
 }
 
 /// 用 api_key 驱动 tp-agent 完成 login + self-enroll（spawn CLI，复用现成逻辑）。
@@ -209,13 +284,18 @@ pub fn extract_auth_url(line: &str) -> Option<String> {
 /// OAuth、登录 Y 失败)。**不重复注册由云端 self-enroll 的机器幂等保证**:self-enroll
 /// 按 (tenant_id, machine_id) 查已有 edge node,同机器同账户复用同一节点(返回 200、
 /// 不新建),machine_id 在本机持久化稳定。即:授权登 Y → self-enroll 自动按机器去重。
-pub fn login_with_browser<F>(
+/// `on_child_spawned`:子进程起来后回调一次,传 pid —— 让调用方(lib.rs)记下 pid,
+/// 以便用户关授权窗 / 点取消时 kill 掉它(否则 tp-agent pair-poll 会一直轮询到自身
+/// 超时,前端永久 loading)。kill 后本函数的 `child.wait()` 立即返回,流程干净 unwind。
+pub fn login_with_browser<F, P>(
     api_base_url: Option<&str>,
     web_base_url: Option<&str>,
     on_auth_url: F,
+    on_child_spawned: P,
 ) -> Result<AgentStatus, String>
 where
     F: FnOnce(String),
+    P: FnOnce(u32),
 {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
@@ -234,6 +314,9 @@ where
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn tp-agent login: {e}"))?;
+
+    // 把 pid 交给调用方登记(用于取消)。
+    on_child_spawned(child.id());
 
     let stdout = child
         .stdout

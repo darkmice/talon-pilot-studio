@@ -1,6 +1,39 @@
 mod agent;
 mod config;
 
+use std::sync::Mutex;
+
+/// 进行中的 OAuth 登录子进程 pid 登记表。agent_login_browser spawn 子进程时记下,
+/// 用户关授权窗 / 点「取消」时据此 kill —— 否则 tp-agent pair-poll 会一直轮询到自身
+/// 超时(数分钟),前端永久 loading。同一时刻只允许一个登录流程,Option 足够。
+static LOGIN_PID: Mutex<Option<u32>> = Mutex::new(None);
+
+/// 跨平台杀进程(取消登录用)。unix 用 SIGTERM(kill 命令避免引 nix);Windows 用 taskkill。
+fn kill_pid(pid: u32) {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
+/// 取消进行中的 WebView 登录:kill 已登记的 tp-agent 子进程。
+/// 前端「取消」按钮 + 授权窗 close 事件都调它。无进行中登录时 no-op。
+#[tauri::command]
+fn agent_login_cancel() {
+    let pid = LOGIN_PID.lock().ok().and_then(|g| *g);
+    if let Some(pid) = pid {
+        kill_pid(pid);
+    }
+}
+
 /// 查询本机 tp-agent 状态（spawn `tp-agent status --json`）。
 #[tauri::command]
 fn agent_status() -> Result<agent::AgentStatus, String> {
@@ -35,13 +68,23 @@ async fn agent_login_browser(
     let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
 
     // login_with_browser 阻塞(流式读 + wait 子进程,可能数分钟),放 blocking 线程。
+    // on_child_spawned 把子进程 pid 登记到 LOGIN_PID,供取消用。
     let join = tauri::async_runtime::spawn_blocking(move || {
         let mut url_tx = Some(url_tx);
-        agent::login_with_browser(api_base_url.as_deref(), web_base_url.as_deref(), |url| {
-            if let Some(tx) = url_tx.take() {
-                let _ = tx.send(url);
-            }
-        })
+        agent::login_with_browser(
+            api_base_url.as_deref(),
+            web_base_url.as_deref(),
+            |url| {
+                if let Some(tx) = url_tx.take() {
+                    let _ = tx.send(url);
+                }
+            },
+            |pid| {
+                if let Ok(mut g) = LOGIN_PID.lock() {
+                    *g = Some(pid);
+                }
+            },
+        )
     });
 
     // 等授权 URL 就绪 → 开 WebView 窗口加载它(tp-agent loopback callback 会完成闭环)。
@@ -52,7 +95,7 @@ async fn agent_login_browser(
         Ok(url) => {
             match url.parse::<tauri::Url>() {
                 Ok(parsed) => {
-                    if let Err(e) = WebviewWindowBuilder::new(
+                    match WebviewWindowBuilder::new(
                         &app,
                         "agent-auth",
                         WebviewUrl::External(parsed),
@@ -61,7 +104,21 @@ async fn agent_login_browser(
                     .inner_size(480.0, 720.0)
                     .build()
                     {
-                        window_err = Some(format!("open auth window: {e}"));
+                        Ok(win) => {
+                            // 用户关授权窗 = 取消登录:kill tp-agent 子进程,否则它会
+                            // pair-poll 轮询到超时,join.await 一直阻塞、前端永久 loading。
+                            win.on_window_event(|ev| {
+                                if let tauri::WindowEvent::CloseRequested { .. } = ev {
+                                    let pid = LOGIN_PID.lock().ok().and_then(|g| *g);
+                                    if let Some(pid) = pid {
+                                        kill_pid(pid);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            window_err = Some(format!("open auth window: {e}"));
+                        }
                     }
                 }
                 Err(e) => {
@@ -76,7 +133,14 @@ async fn agent_login_browser(
     }
 
     // 无论开窗成功失败,都要 await join 收掉 login 任务(否则子进程泄漏)。
+    // 被取消(关窗/取消按钮 kill 子进程)时,login_with_browser 的 child.wait() 立即
+    // 返回,join 在此收到一个 Err(进程被信号终止),正常 unwind,不再卡住。
     let result = join.await.map_err(|e| format!("login task join: {e}"))?;
+
+    // 登录流程结束,清掉 pid 登记(避免悬挂的旧 pid 被后续误 kill)。
+    if let Ok(mut g) = LOGIN_PID.lock() {
+        *g = None;
+    }
 
     // 登录流程结束,关掉授权窗口(成功失败都关)。
     if let Some(w) = app.get_webview_window("agent-auth") {
@@ -157,7 +221,8 @@ pub fn run() {
             agent_status,
             agent_install,
             agent_login,
-            agent_login_browser
+            agent_login_browser,
+            agent_login_cancel
         ])
         .setup(|app| {
             // 初始窗口尺寸按屏幕自适应:宽高都取屏幕 80%(与屏幕同比例),并居中。
