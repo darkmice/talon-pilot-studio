@@ -166,11 +166,19 @@ jobs:
         working-directory: repos/talon-pilot-studio
         run: node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.version=process.env.GITHUB_REF_NAME.replace(/^v/,'');fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');console.log('version =>',c.version);"
 
+      # 清掉 cargo cache 里上一次构建残留的 bundle 产物 —— 否则旧版本号(如 0.1.0)的
+      # .dmg/.exe/.deb 会被 collect 步一并捞进 Release,污染资产列表。target 其余编译
+      # 缓存保留(只删 bundle 输出目录)。
+      - name: Clean stale bundle dir
+        working-directory: repos/talon-pilot-studio
+        shell: bash
+        run: rm -rf "src-tauri/target/${{ matrix.rust_target }}/release/bundle" || true
+
       - name: Tauri build
         working-directory: repos/talon-pilot-studio
         env:
           # updater 签名私钥(自有 minisign,与 Apple 证书无关)。设置后 tauri build 会
-          # 额外产 updater 包(macOS .app.tar.gz / Windows .nsis.zip / Linux .AppImage)
+          # 额外产 updater 包(macOS .app.tar.gz / Windows -setup.exe + .msi / Linux .AppImage)
           # 及其 .sig 签名文件;app 自更新时用 tauri.conf pubkey 校验这些 .sig。
           # 私钥无密码生成,故不需要 TAURI_SIGNING_PRIVATE_KEY_PASSWORD。
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -335,7 +343,10 @@ jobs:
         with:
           files: release-files/*
           draft: false
-          prerelease: true # 内测:标 prerelease
+          # 不能标 prerelease:updater endpoint 用 GitHub `/releases/latest/download/`,
+          # 该端点**只认正式 release,跳过 prerelease** → 标了 prerelease 客户端永远拉不到
+          # latest.json,自动更新直接失效。内测语义放正文说明,不靠 prerelease 标记。
+          prerelease: false
           body: |
             ## Talon Pilot Studio ${{ github.ref_name }}（内测）
 
