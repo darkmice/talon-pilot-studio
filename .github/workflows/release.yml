@@ -35,9 +35,9 @@ name: Release (multi-platform, unsigned)
 #   APPLE_CERTIFICATE          —— Developer ID Application 证书导出的 .p12 的 base64。
 #   APPLE_CERTIFICATE_PASSWORD —— 导出 .p12 时设的密码。
 #   APPLE_SIGNING_IDENTITY     —— 形如 "Developer ID Application: Watusi LLC (35N673QYJ7)"。
-#   APPLE_API_ISSUER           —— App Store Connect API Key 的 Issuer ID(UUID)。
-#   APPLE_API_KEY_ID           —— 该 API Key 的 Key ID(10 位)。
-#   APPLE_API_KEY_P8           —— 该 API Key 的 AuthKey_*.p8 文件的 base64(公证用)。
+#   APPLE_ID                   —— 你的 Apple ID 邮箱(须为该团队成员)。
+#   APPLE_PASSWORD             —— 该 Apple ID 的 App 专用密码(appleid.apple.com 生成,公证用)。
+#   APPLE_TEAM_ID              —— 团队 ID,如 35N673QYJ7。
 
 on:
   push:
@@ -214,27 +214,22 @@ jobs:
         shell: bash
         run: rm -rf "src-tauri/target/${{ matrix.rust_target }}/release/bundle" || true
 
-      # macOS Apple 签名+公证准备(仅 macOS,且配齐 secrets 时):
-      #   - 把 App Store Connect API Key(.p8 的 base64)写成文件,导出 APPLE_API_KEY_PATH;
-      #   - 把真实 Developer ID 签名身份写进 tauri.conf.json(覆盖默认 "-" ad-hoc),
-      #     避免 env 与 config 优先级歧义。
+      # macOS Apple 签名身份准备(仅 macOS,且配齐 secrets 时):
+      #   把真实 Developer ID 签名身份写进 tauri.conf.json(覆盖默认 "-" ad-hoc),
+      #   避免 env 与 config 优先级歧义。公证凭证走 Apple ID + App 专用密码(见下方 build env)。
       # secrets 缺失(fork / 未配置)时本步 no-op,Tauri build 退回 ad-hoc 未签名 —— 不破坏现有流程。
-      - name: Prepare macOS signing & notarization
+      - name: Prepare macOS signing
         if: startsWith(matrix.runner, 'macos')
         working-directory: repos/talon-pilot-studio
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
           if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
             echo "未配置 Apple 签名 secrets —— 跳过,产 ad-hoc 未签名包(现有行为)。"
             exit 0
           fi
-          mkdir -p "$RUNNER_TEMP/notary"
-          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary/AuthKey.p8"
-          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/notary/AuthKey.p8" >> "$GITHUB_ENV"
           node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.bundle.macOS=c.bundle.macOS||{};c.bundle.macOS.signingIdentity=process.env.APPLE_SIGNING_IDENTITY;fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');console.log('signingIdentity =>',c.bundle.macOS.signingIdentity);"
 
       - name: Tauri build
@@ -247,12 +242,13 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           # macOS Apple 签名+公证(其余平台忽略这些 env)。配齐 secrets 时:
           #   APPLE_CERTIFICATE(+PASSWORD)→ Tauri 临时钥匙串导入 .p12 并签名;
-          #   APPLE_API_ISSUER/APPLE_API_KEY(Key ID)/APPLE_API_KEY_PATH → notarytool 公证 + staple。
+          #   APPLE_ID/APPLE_PASSWORD(App 专用密码)/APPLE_TEAM_ID → notarytool 公证 + staple。
           # secrets 缺失时这些为空,Tauri 跳过签名/公证 → ad-hoc 未签名(现有行为)。
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: pnpm tauri build --target ${{ matrix.rust_target }}
 
       # ── 7. 收集产物(各平台 bundle 类型不同) ───────────────────────────

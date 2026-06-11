@@ -20,17 +20,21 @@
 配齐下面这组 Secret 后，macOS 产物会用 **Developer ID** 签名、经 Apple **公证(notarize)** 并 staple，
 用户下载直接打开无「无法验证开发者」警告。**全部缺失时退回 ad-hoc 未签名**（首开右键→打开），不影响构建。
 
+公证用 **Apple ID + App 专用密码**(只需团队成员的 Apple ID,不需要 Admin/Account Holder
+权限 —— App Store Connect API Key 那条路只有 Admin/Account Holder 能建)。
+
 | Secret | 怎么拿 |
 |---|---|
 | `APPLE_CERTIFICATE` | 钥匙串导出 Developer ID Application 证书（含私钥）为 `.p12`，再 `base64 -i cert.p12 \| pbcopy` |
 | `APPLE_CERTIFICATE_PASSWORD` | 导出 `.p12` 时设的密码 |
 | `APPLE_SIGNING_IDENTITY` | `security find-identity -v -p codesigning` 里那条，形如 `Developer ID Application: Watusi LLC (35N673QYJ7)` |
-| `APPLE_API_ISSUER` | App Store Connect → 用户和访问 → 集成/密钥 → App Store Connect API，页面顶部的 **Issuer ID**（UUID） |
-| `APPLE_API_KEY_ID` | 同页生成一个 API Key，它的 **Key ID**（10 位） |
-| `APPLE_API_KEY_P8` | 生成 API Key 时**只能下载一次**的 `AuthKey_XXXX.p8`，`base64 -i AuthKey_XXXX.p8 \| pbcopy` |
+| `APPLE_ID` | 你的 Apple ID 邮箱（须为该团队成员） |
+| `APPLE_PASSWORD` | 该 Apple ID 的 **App 专用密码**：appleid.apple.com → 登录与安全 → App 专用密码 → 生成（形如 `xxxx-xxxx-xxxx-xxxx`） |
+| `APPLE_TEAM_ID` | 团队 ID，如 `35N673QYJ7`（`security find-identity` 那条括号里的就是） |
 
-> - Developer ID 证书只有 **Account Holder** 能创建；App Store Connect API Key 需 **Admin/Account Holder** 权限。没权限就用 Apple ID + App 专用密码方案（改 release.yml 的公证 env 为 `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID`）。
-> - 证书私钥与 `.p12` 是敏感材料,只放 GitHub Secret,别提交进仓库。
+> - Developer ID 证书只有 **Account Holder** 能创建（本项目已有）。
+> - 证书私钥与 `.p12`、App 专用密码都是敏感材料，只放 GitHub Secret，别提交进仓库。
+> - App 专用密码要求该 Apple ID 已开启双重认证。
 > - 公证偶发因 entitlements/hardened-runtime 失败,届时按 notarytool 日志补 entitlements。
 
 ---
