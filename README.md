@@ -44,3 +44,21 @@
 </details>
 
 > 应用还在持续更新中。升级方式：到 [Releases](https://github.com/darkmice/talon-pilot-studio/releases) 下载新版覆盖安装。
+
+## 高级配置（可选）
+
+配置文件：macOS/Linux `~/.config/talon-pilot-studio/config.toml`，Windows `%APPDATA%\talon-pilot-studio\config.toml`。
+所有键都可选，亦可用同名环境变量临时覆盖（优先级：环境变量 > 配置文件 > 内置默认）：
+
+| 键 | 环境变量 | 作用 |
+|---|---|---|
+| `api_base` | `TP_API_BASE` | 后端云端地址（内网/私有部署填这里） |
+| `agent_download_base` | `TP_AGENT_DOWNLOAD_BASE` | tp-agent 安装包镜像基地址（直连 GitHub 不稳时配；目录内平铺四个平台资产） |
+| `update_endpoint` | `TP_UPDATE_ENDPOINT` | 应用自更新 latest.json 镜像地址 |
+
+```toml
+# 示例
+api_base = "https://agents.deeplan.ai"
+agent_download_base = "https://mirror.example.com/tp-agent"
+update_endpoint = "https://mirror.example.com/studio/latest.json"
+```

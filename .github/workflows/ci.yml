@@ -1,0 +1,68 @@
+name: CI
+
+# 质量门禁:push / PR 都跑 fmt + clippy(-D warnings)+ test。
+# 此前仓库只有 release.yml,agent_test.rs 等单测在 CI 里从来没跑过。
+#
+# 注意:cargo 编译 tauri 需要前端 dist 存在(generate_context! 编译期读
+# frontendDist 路径)。CI 不构建真前端(那是 release 的事、要跨仓 PAT),
+# 这里放一个最小占位 index.html 满足编译即可 —— 单测/clippy 不跑前端。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repos/talon-pilot-studio
+
+      # tauri.conf.json frontendDist 指 ../../talon-pilot/web-next/dist(相对
+      # src-tauri),在 repos/ 布局下落到 repos/talon-pilot/web-next/dist。
+      - name: Stub frontend dist
+        run: |
+          mkdir -p repos/talon-pilot/web-next/dist
+          echo '<!doctype html><title>ci stub</title>' > repos/talon-pilot/web-next/dist/index.html
+
+      - name: Install Linux deps (Tauri/WebKitGTK)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            repos/talon-pilot-studio/src-tauri/target
+          key: ci-cargo-${{ hashFiles('repos/talon-pilot-studio/src-tauri/Cargo.lock') }}
+          restore-keys: ci-cargo-
+
+      - name: cargo fmt
+        working-directory: repos/talon-pilot-studio/src-tauri
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        working-directory: repos/talon-pilot-studio/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: repos/talon-pilot-studio/src-tauri
+        run: cargo test

@@ -8,6 +8,9 @@
     "core:window:allow-start-dragging",
     "updater:default",
     "process:default",
-    "dialog:default"
+    "dialog:default",
+    "opener:default",
+    "opener:allow-reveal-item-in-dir",
+    "notification:default"
   ]
 }

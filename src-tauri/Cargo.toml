@@ -1,6 +1,6 @@
 [package]
 name = "talon-pilot-studio"
-version = "0.1.0"
+version = "0.1.6"
 description = "Talon Pilot 桌面客户端"
 edition = "2021"
 rust-version = "1.77"
@@ -13,13 +13,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon:系统托盘(显示主窗口/检查更新/退出)。
+tauri = { version = "2", features = ["tray-icon"] }
 # 自动更新:updater 校验下载包的 minisign 签名(自有密钥,跟 Apple 证书无关),
 # 整套检查/下载/安装在 Rust 侧跑(不耦合共享前端 web-next);dialog 弹原生确认框,
 # process 在用户同意后 relaunch 重启自身完成替换。endpoint/pubkey 在 tauri.conf.json。
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
+# opener:外链系统浏览器打开 / 文件管理器定位;notification:任务完成原生通知。
+# 壳侧只注册,web-next 经 window.__TAURI__ 调用(capability 放行)。
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 which = "6"
@@ -27,11 +32,19 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 flate2 = "1"
 tar = "0.4"
 tokio = { version = "1", features = ["sync"] }
+# 自绘更新弹窗:内嵌 logo PNG 编 base64;pulldown-cmark 把发布说明的 Markdown 渲染成 HTML。
+base64 = "0.22"
+# default-features=false 去掉 CLI 用的 getopts;只留 html(渲染所需)。
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
 # Windows tp-agent 包是 .zip(其余平台 tar.gz),仅 Windows 需 zip 解压。
 # default-features = false 去掉不必要的压缩后端,只留 deflate(GitHub release zip 用 deflate)。
 [target.'cfg(target_os = "windows")'.dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# 单实例:二次启动直接聚焦已有窗口(双实例会双 updater/双登录互踩)。桌面专属插件。
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
 
 [profile.release]
 codegen-units = 1

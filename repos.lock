@@ -1,0 +1,10 @@
+# 发版依赖仓的 ref 锁定 —— release.yml 按这里的 ref checkout talon-pilot / talon-ui。
+#
+# 为什么:tauri.conf.json 的 frontendDist 跨仓引用 talon-pilot/web-next 的构建产物,
+# 不锁 ref 的话同一个 tag 在不同时间重跑会打出不同前端(不可复现、无法回滚)。
+#
+# 用法:
+#   - 日常可以填分支名(跟最新),发正式版前应锁成具体 commit SHA;
+#   - workflow_dispatch 手动跑时可用 inputs 临时覆盖,不用改文件。
+talon_pilot_ref = "main"
+talon_ui_ref = "main"

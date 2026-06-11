@@ -58,7 +58,10 @@ fn latest_download_url() {
 #[test]
 fn versioned_download_url_strips_v_prefix() {
     let url = release_download_url("r/x", Some("v0.1.2"), "a.tar.gz");
-    assert_eq!(url, "https://github.com/r/x/releases/download/v0.1.2/a.tar.gz");
+    assert_eq!(
+        url,
+        "https://github.com/r/x/releases/download/v0.1.2/a.tar.gz"
+    );
 }
 
 #[test]
@@ -79,7 +82,25 @@ fn extract_auth_url_trims_trailing_whitespace() {
 
 #[test]
 fn extract_auth_url_ignores_other_lines() {
-    assert_eq!(extract_auth_url("打开浏览器完成 Talon Pilot 登录授权 ..."), None);
+    assert_eq!(
+        extract_auth_url("打开浏览器完成 Talon Pilot 登录授权 ..."),
+        None
+    );
     assert_eq!(extract_auth_url("pair-init ok"), None);
     assert_eq!(extract_auth_url(""), None);
+}
+
+/// P0 回归:安装到任何候选目录,检测候选必须能覆盖到 —— 两套列表曾经不一致,
+/// Windows / macOS 回退路径(~/.local/bin、%LOCALAPPDATA%\Programs)装完即报"未安装"。
+#[test]
+fn locate_covers_every_install_dir() {
+    let name = super::tp_agent_bin_name();
+    let locate = super::locate_candidates();
+    for dir in super::install_dir_candidates() {
+        assert!(
+            locate.contains(&dir.join(name)),
+            "安装目录 {} 不在检测候选里(install/locate 又脱钩了)",
+            dir.display()
+        );
+    }
 }

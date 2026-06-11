@@ -12,6 +12,9 @@ name: Release (multi-platform, unsigned)
 # 三仓 checkout 到 $GITHUB_WORKSPACE/repos/{talon-ui,talon-pilot,talon-pilot-studio},
 # 让相对路径 ../../ 在 repos/ 下成立。
 #
+# 可复现:talon-pilot / talon-ui 按仓库根 repos.lock 锁定的 ref checkout(发版前
+# 应锁成 commit SHA);workflow_dispatch 的 inputs 可临时覆盖。
+#
 # 签名:无 Apple / Windows 证书 → 产**未签名**安装包。
 #   - macOS: ad-hoc 自签(tauri.conf signingIdentity "-");首开右键→打开 绕 Gatekeeper
 #   - Windows: 未签名 .msi/.exe;SmartScreen 可能提示,选「仍要运行」
@@ -38,6 +41,14 @@ on:
         description: "只构建不发 Release(测试流水线)"
         type: boolean
         default: true
+      talon_pilot_ref:
+        description: "覆盖 repos.lock 的 talon-pilot ref(留空用锁定值)"
+        type: string
+        default: ""
+      talon_ui_ref:
+        description: "覆盖 repos.lock 的 talon-ui ref(留空用锁定值)"
+        type: string
+        default: ""
 
 permissions:
   contents: write # 创建 Release / 上传产物需要
@@ -76,10 +87,30 @@ jobs:
         with:
           path: repos/talon-pilot-studio
 
+      # 依赖仓 ref 决议:dispatch input(临时覆盖)> repos.lock(锁定值)。
+      # 不锁 ref 的话同一 tag 重跑会打出不同前端 —— 不可复现、坏了无法回滚。
+      - name: Resolve dependency refs (repos.lock)
+        id: refs
+        shell: bash
+        run: |
+          lock="repos/talon-pilot-studio/repos.lock"
+          read_ref() { grep -E "^$1[[:space:]]*=" "$lock" | head -1 | sed -E 's/^[^=]*=[[:space:]]*"([^"]*)".*/\1/'; }
+          pilot="${{ inputs.talon_pilot_ref }}"
+          ui="${{ inputs.talon_ui_ref }}"
+          [ -n "$pilot" ] || pilot=$(read_ref talon_pilot_ref)
+          [ -n "$ui" ] || ui=$(read_ref talon_ui_ref)
+          if [ -z "$pilot" ] || [ -z "$ui" ]; then
+            echo "::error::repos.lock 缺 talon_pilot_ref / talon_ui_ref"; exit 1
+          fi
+          echo "talon-pilot @ $pilot, talon-ui @ $ui"
+          echo "pilot=$pilot" >> "$GITHUB_OUTPUT"
+          echo "ui=$ui" >> "$GITHUB_OUTPUT"
+
       - name: Checkout talon-ui (public)
         uses: actions/checkout@v4
         with:
           repository: darkmice/talon-ui
+          ref: ${{ steps.refs.outputs.ui }}
           path: repos/talon-ui
 
       - name: Checkout talon-pilot (private — web-next 前端源)
@@ -87,6 +118,7 @@ jobs:
         with:
           repository: darkmice/talon-pilot
           token: ${{ secrets.TALON_PILOT_PAT }}
+          ref: ${{ steps.refs.outputs.pilot }}
           path: repos/talon-pilot
 
       # ── 2. Linux 系统依赖(Tauri/WebKitGTK 必需) ────────────────────────
@@ -244,6 +276,59 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 取 CHANGELOG.md(发版说明唯一真相源)。本仓在 tag 处 checkout 到子目录,
+      # 不与下载的产物目录冲突。
+      - name: Checkout (CHANGELOG)
+        uses: actions/checkout@v4
+        with:
+          path: studio-src
+
+      # 抽取本版本的 CHANGELOG 段落 → notes.md(给 latest.json 的 notes,应用内弹窗
+      # 渲染 Markdown)+ body.md(GitHub Release 正文 = 说明 + 下载表)。一处维护两处一致。
+      - name: Extract release notes
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -e
+          VER="${VERSION#v}"
+          CHANGELOG="studio-src/CHANGELOG.md"
+          notes=""
+          if [ -f "$CHANGELOG" ]; then
+            # 取 `## <ver>` 与下一个 `## ` 之间的内容(ver 里的 . 用正则匹配,够用)。
+            notes=$(awk -v ver="$VER" '
+              $0 ~ "^##[[:space:]]+" ver "([^0-9.]|$)" { cap=1; next }
+              /^##[[:space:]]/ { if (cap) exit }
+              cap { print }
+            ' "$CHANGELOG")
+          fi
+          # CHANGELOG 缺该版本段落时兜底,绝不产出空 notes。
+          if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+            notes="Talon Pilot Studio ${VERSION} — 详见 Release 说明。"
+          fi
+          printf '%s\n' "$notes" > notes.md
+          # Release 正文 = 说明 + 下载表 + 未签名提示。
+          {
+            printf '%s\n\n' "$notes"
+            echo '---'
+            echo
+            echo '下载对应平台安装包:'
+            echo
+            echo '| 平台 | 文件 |'
+            echo '|---|---|'
+            echo '| macOS (Apple Silicon) | `*_aarch64.dmg` |'
+            echo '| macOS (Intel) | `*_x64.dmg` |'
+            echo '| Windows | `*.msi` / `*-setup.exe` |'
+            echo '| Linux | `*.deb` / `*.AppImage` |'
+            echo
+            echo '> ⚠️ **未签名构建(测试版)**'
+            echo '> - **macOS**:首次打开右键 App →「打开」,或 `xattr -dr com.apple.quarantine "/Applications/Talon Pilot Studio.app"`'
+            echo '> - **Windows**:SmartScreen 提示时选「更多信息」→「仍要运行」'
+            echo '>'
+            echo '> **自动更新已启用**:装好后续版本会在启动时检测,弹窗确认即自动下载升级。'
+          } > body.md
+          echo "=== notes.md ==="; cat notes.md
+          echo "=== body.md ==="; cat body.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -276,6 +361,8 @@ jobs:
           # tag 形如 v0.1.5 → 版本号 0.1.5(去掉前导 v)
           VER="${VERSION#v}"
           BASE="https://github.com/${REPO}/releases/latest/download"
+          # 把上一步抽好的 CHANGELOG 段落编码成 JSON 字符串作 notes(含换行、Markdown)。
+          NOTES_JSON=$(jq -Rs . < "$GITHUB_WORKSPACE/notes.md")
           cd release-files
 
           # 给定 .sig 文件名 + 目标 url,输出一个 platform JSON 片段(无尾逗号)
@@ -326,7 +413,7 @@ jobs:
           cat > latest.json <<EOF
           {
             "version": "${VER}",
-            "notes": "Talon Pilot Studio ${VERSION} — 详见 Release 说明。",
+            "notes": ${NOTES_JSON},
             "pub_date": "${PUB_DATE}",
             "platforms": {
           ${PLATFORMS}
@@ -347,20 +434,5 @@ jobs:
           # 该端点**只认正式 release,跳过 prerelease** → 标了 prerelease 客户端永远拉不到
           # latest.json,自动更新直接失效。内测语义放正文说明,不靠 prerelease 标记。
           prerelease: false
-          body: |
-            ## Talon Pilot Studio ${{ github.ref_name }}（内测）
-
-            你的 AI 数字员工指挥台桌面客户端。下载对应平台安装包：
-
-            | 平台 | 文件 |
-            |---|---|
-            | macOS (Apple Silicon) | `*_aarch64.dmg` |
-            | macOS (Intel) | `*_x64.dmg` |
-            | Windows | `*.msi` / `*-setup.exe` |
-            | Linux | `*.deb` / `*.AppImage` |
-
-            > ⚠️ **未签名构建（测试版）**
-            > - **macOS**：首次打开右键 App →「打开」，或 `xattr -dr com.apple.quarantine "/Applications/Talon Pilot Studio.app"`
-            > - **Windows**：SmartScreen 提示时选「更多信息」→「仍要运行」
-            >
-            > **自动更新已启用**：装好后续版本会在启动时检测，弹窗确认即自动下载升级（无需手动重下）。
+          # 正文来自上面用 CHANGELOG 段落生成的 body.md(说明 + 下载表),与应用内弹窗同源。
+          body_path: body.md

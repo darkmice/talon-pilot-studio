@@ -1,5 +1,7 @@
 mod agent;
 mod config;
+mod updater_ui;
+mod window_state;
 
 use std::sync::Mutex;
 
@@ -26,7 +28,8 @@ fn kill_pid(pid: u32) {
 
 /// 取消进行中的 WebView 登录:kill 已登记的 tp-agent 子进程。
 /// 前端「取消」按钮 + 授权窗 close 事件都调它。无进行中登录时 no-op。
-#[tauri::command]
+/// (async):kill/taskkill 是 spawn 子进程并等退出,不能占主线程。
+#[tauri::command(async)]
 fn agent_login_cancel() {
     let pid = LOGIN_PID.lock().ok().and_then(|g| *g);
     if let Some(pid) = pid {
@@ -35,22 +38,62 @@ fn agent_login_cancel() {
 }
 
 /// 查询本机 tp-agent 状态（spawn `tp-agent status --json`）。
-#[tauri::command]
+/// (async):Tauri 2 非 async 命令在主线程跑,spawn+wait 子进程会卡 UI。
+#[tauri::command(async)]
 fn agent_status() -> Result<agent::AgentStatus, String> {
     agent::fetch_status()
 }
 
-/// 帮装 tp-agent（macOS arm64，从 GitHub release）。返回安装路径。
+/// 帮装 tp-agent(跨平台,从配置镜像 / GitHub Release 下载)。返回安装路径。
+/// 下载在 blocking 线程跑(此前在主线程同步下载,慢网整窗冻结、断网永久挂起),
+/// 进度经 `agent-install-progress` 事件发前端:payload {downloaded, total},
+/// total 可能为 null(服务器没报 Content-Length)。事件按 ≥256KB 间隔节流。
 #[tauri::command]
-fn agent_install() -> Result<String, String> {
-    agent::install_tp_agent().map(|p| p.display().to_string())
+async fn agent_install(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri::Emitter;
+
+    let join = tauri::async_runtime::spawn_blocking(move || {
+        let mut last_emitted = 0u64;
+        agent::install_tp_agent(move |downloaded, total| {
+            if downloaded - last_emitted < 256 * 1024 && Some(downloaded) != total {
+                return;
+            }
+            last_emitted = downloaded;
+            let _ = app.emit(
+                "agent-install-progress",
+                serde_json::json!({ "downloaded": downloaded, "total": total }),
+            );
+        })
+    });
+    join.await
+        .map_err(|e| format!("install task join: {e}"))?
+        .map(|p| p.display().to_string())
 }
 
 /// 用 api_key 完成 tp-agent 登录 + self-enroll，返回登录后状态。
 /// (开发态兜底 / CI；正常 UI 走 `agent_login_browser` 完整 OAuth。)
-#[tauri::command]
+#[tauri::command(async)]
 fn agent_login(api_key: String) -> Result<agent::AgentStatus, String> {
     agent::login_with_key(&api_key)
+}
+
+/// 启动 tp-agent daemon(幂等)。
+#[tauri::command(async)]
+fn agent_start() -> Result<agent::AgentStatus, String> {
+    agent::start_daemon()
+}
+
+/// 停止 tp-agent daemon。
+#[tauri::command(async)]
+fn agent_stop() -> Result<agent::AgentStatus, String> {
+    agent::stop_daemon()
+}
+
+/// 重启 tp-agent daemon —— 多账号登录新账号后,daemon 在跑时要重启才生效,
+/// 前端在 `agent_login_browser` 成功且 status.running 时引导用户调这个。
+#[tauri::command(async)]
+fn agent_restart() -> Result<agent::AgentStatus, String> {
+    agent::restart_daemon()
 }
 
 /// WebView 完整 OAuth 登录闭环：spawn `tp-agent login --suppress-browser --print-auth-url`，
@@ -216,14 +259,33 @@ const TITLEBAR_DRAG_SCRIPT: &str = r#"
 
 /// 检查并(经用户确认后)应用更新。供启动后台调用与手动 `app_check_update` 命令复用。
 ///
-/// 流程:updater.check() 拉 endpoint 的 latest.json,与本机版本比对 —— 有新版才弹原生
-/// 确认框;用户同意则 download_and_install(updater 边下边用 pubkey 校验 minisign 签名,
-/// 校验失败直接报错不会装上损坏/被篡改包)+ relaunch 重启完成替换。
+/// 流程:updater.check() 拉 endpoint 的 latest.json,与本机版本比对 —— 有新版才弹**自绘
+/// 品牌弹窗**(updater_ui,Logo 居中 + 进度条);用户点「立即更新」才 download_and_install
+/// (updater 边下边用 pubkey 校验 minisign 签名,校验失败直接报错不会装上损坏/被篡改包)+
+/// relaunch 重启完成替换。
 /// 静默策略:无更新 / 检查失败(离线、GitHub 不可达)都不打扰用户,只在控制台留痕。
 async fn check_for_update(app: tauri::AppHandle) {
     use tauri_plugin_updater::UpdaterExt;
 
-    let updater = match app.updater() {
+    // 用户配置了 update_endpoint(镜像/内网)则覆盖 tauri.conf.json 内置 endpoint;
+    // 配置无效时退回内置默认并留痕,不能让一行错配置弄瞎整个自更新。
+    let builder = match config::resolve_update_endpoint()
+        .map(|ep| -> Result<_, String> {
+            let url: tauri::Url = ep.parse().map_err(|e| format!("{ep}: {e}"))?;
+            app.updater_builder()
+                .endpoints(vec![url])
+                .map_err(|e| format!("{ep}: {e}"))
+        })
+        .transpose()
+    {
+        Ok(Some(b)) => b,
+        Ok(None) => app.updater_builder(),
+        Err(e) => {
+            eprintln!("[updater] 自定义 update_endpoint 无效,改用内置默认: {e}");
+            app.updater_builder()
+        }
+    };
+    let updater = match builder.build() {
         Ok(u) => u,
         Err(e) => {
             eprintln!("[updater] 初始化失败: {e}");
@@ -233,56 +295,18 @@ async fn check_for_update(app: tauri::AppHandle) {
 
     let update = match updater.check().await {
         Ok(Some(update)) => update,
-        Ok(None) => return,           // 已是最新
+        Ok(None) => return, // 已是最新
         Err(e) => {
             eprintln!("[updater] 检查更新失败(忽略): {e}");
             return;
         }
     };
 
-    // 有新版本 —— 弹原生确认框(异步,不阻塞)。用户同意才下载安装。
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    // 有新版本 —— 开自绘品牌弹窗(下载/安装/进度/重启都在 updater_ui 里驱动)。
     let current = app.package_info().version.to_string();
-    let new_version = update.version.clone();
-    let notes = update.body.clone().unwrap_or_default();
-    let body = if notes.trim().is_empty() {
-        format!("发现新版本 {new_version}(当前 {current})。是否现在更新?\n更新后应用会自动重启。")
-    } else {
-        format!("发现新版本 {new_version}(当前 {current})。\n\n{notes}\n\n是否现在更新?更新后应用会自动重启。")
-    };
-
-    let app_for_dialog = app.clone();
-    app.dialog()
-        .message(body)
-        .title("Talon Pilot Studio 有可用更新")
-        .kind(MessageDialogKind::Info)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "立即更新".to_string(),
-            "稍后".to_string(),
-        ))
-        .show(move |confirmed| {
-            if !confirmed {
-                return;
-            }
-            let app = app_for_dialog.clone();
-            tauri::async_runtime::spawn(async move {
-                match update.download_and_install(|_chunk, _total| {}, || {}).await {
-                    Ok(()) => {
-                        // 安装完成,重启自身让新版本生效(进程级 relaunch)。
-                        use tauri::Manager;
-                        tauri::process::restart(&app.env());
-                    }
-                    Err(e) => {
-                        use tauri_plugin_dialog::DialogExt as _;
-                        app.dialog()
-                            .message(format!("更新失败: {e}"))
-                            .title("更新失败")
-                            .kind(tauri_plugin_dialog::MessageDialogKind::Error)
-                            .blocking_show();
-                    }
-                }
-            });
-        });
+    if let Err(e) = updater_ui::show_update_dialog(&app, update, current) {
+        eprintln!("[updater] 打开更新弹窗失败(忽略): {e}");
+    }
 }
 
 /// 手动触发检查更新(设置页/菜单可调)。无更新或失败时静默(同后台策略)。
@@ -291,50 +315,176 @@ async fn app_check_update(app: tauri::AppHandle) {
     check_for_update(app).await;
 }
 
+/// 显示并聚焦主窗口(托盘点击 / 二次启动聚焦共用)。
+fn show_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
+/// 保存主窗口几何(物理像素),下次启动原样恢复。关窗 / 托盘退出前调用。
+fn save_main_window_geometry(win: &tauri::WebviewWindow) {
+    if let (Ok(pos), Ok(size)) = (win.outer_position(), win.inner_size()) {
+        window_state::save(&window_state::WindowGeometry {
+            x: pos.x,
+            y: pos.y,
+            width: size.width,
+            height: size.height,
+        });
+    }
+}
+
+/// 系统托盘:左键点图标显示主窗口;菜单 = 显示主窗口 / 检查更新 / 退出。
+/// 不改关闭行为(关窗即退出):任务跑在 tp-agent daemon 里,应用无须常驻,托盘只做快捷入口。
+#[cfg(desktop)]
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    use tauri::Manager;
+
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let update = MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &update, &quit])?;
+
+    TrayIconBuilder::with_id("main")
+        .icon(app.default_window_icon().ok_or("默认窗口图标缺失")?.clone())
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, ev| match ev.id.as_ref() {
+            "show" => show_main_window(app),
+            "check-update" => {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    check_for_update(handle).await;
+                });
+            }
+            "quit" => {
+                // 托盘退出不经过窗口 CloseRequested,先存几何再退。
+                if let Some(win) = app.get_webview_window("main") {
+                    save_main_window_geometry(&win);
+                }
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, ev| {
+            // 左键单击 = 显示主窗口(Windows 习惯;macOS 菜单照常右键弹)
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = ev
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // single-instance 必须最先注册:二次启动的实例在其它插件初始化前就退出,
+    // 并聚焦已有实例 —— 双实例会双 updater / 双登录流程互踩。
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        show_main_window(app);
+    }));
+    builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        // opener:外链系统浏览器打开 / 文件管理器里定位;notification:任务完成原生
+        // 通知。两者壳侧只注册,由 web-next 经 window.__TAURI__ 调(capability 已放行)。
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        // 自绘更新弹窗的内容协议 + 其 HTML 状态(替代不稳的 data: URL 窗口)。
+        .manage(updater_ui::UpdaterHtml::default())
+        .register_uri_scheme_protocol(updater_ui::URI_SCHEME, updater_ui::serve)
         .invoke_handler(tauri::generate_handler![
             agent_status,
             agent_install,
             agent_login,
             agent_login_browser,
             agent_login_cancel,
+            agent_start,
+            agent_stop,
+            agent_restart,
             app_check_update
         ])
         .setup(|app| {
-            // 初始窗口尺寸按屏幕自适应:宽高都取屏幕 80%(与屏幕同比例),并居中。
-            // tauri.conf.json 的 1280×800 是静态兜底(读不到屏幕时用)。
             use tauri::{LogicalPosition, LogicalSize, Manager};
             if let Some(win) = app.get_webview_window("main") {
-                // 窗口在 config 里 visible:false 启动 —— 先按屏幕算好尺寸+位置,再 show,
-                // 避免先以兜底 1280×800 闪一下再跳到目标尺寸/位置。
-                if let Ok(Some(monitor)) = win.current_monitor() {
-                    // monitor.size()/position() 都是物理像素;按 scale_factor 统一转逻辑
-                    // 像素再算,高分屏(retina scale=2)才不会算出半个屏幕大小/错位。
-                    let scale = monitor.scale_factor();
-                    let screen = monitor.size().to_logical::<f64>(scale);
-                    // 屏幕左上角在「虚拟桌面」中的坐标 —— 多显示器/带 dock 偏移时居中靠它,
-                    // 不能假设原点是 (0,0)(副屏 origin 可能是 1920,0 之类)。
-                    let origin = monitor.position().to_logical::<f64>(scale);
+                // 窗口在 config 里 visible:false 启动 —— 先把几何定好再 show,
+                // 避免先以兜底 1280×800 闪一下再跳。优先恢复上次保存的几何
+                // (窗口中心仍落在某个显示器内才算有效);没有/失效则按屏幕 80%
+                // 自适应居中(tauri.conf.json 的 1280×800 是读不到屏幕时的静态兜底)。
+                let mut restored = false;
+                if let Some(g) = window_state::load() {
+                    let monitors: Vec<(i32, i32, u32, u32)> = win
+                        .available_monitors()
+                        .map(|ms| {
+                            ms.iter()
+                                .map(|m| {
+                                    let p = m.position();
+                                    let s = m.size();
+                                    (p.x, p.y, s.width, s.height)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if window_state::is_visible_on(&g, &monitors) {
+                        let _ = win.set_size(tauri::PhysicalSize::new(g.width, g.height));
+                        let _ = win.set_position(tauri::PhysicalPosition::new(g.x, g.y));
+                        restored = true;
+                    }
+                }
+                if !restored {
+                    if let Ok(Some(monitor)) = win.current_monitor() {
+                        // monitor.size()/position() 都是物理像素;按 scale_factor 统一转
+                        // 逻辑像素再算,高分屏(retina scale=2)才不会算出半个屏幕大小/错位。
+                        let scale = monitor.scale_factor();
+                        let screen = monitor.size().to_logical::<f64>(scale);
+                        // 屏幕左上角在「虚拟桌面」中的坐标 —— 多显示器/带 dock 偏移时居中
+                        // 靠它,不能假设原点是 (0,0)(副屏 origin 可能是 1920,0 之类)。
+                        let origin = monitor.position().to_logical::<f64>(scale);
 
-                    // 与屏幕同比例:宽高都取屏幕 80%,窗口形状跟屏幕一致。
-                    let width = (screen.width * 0.8).round().max(960.0);
-                    let height = (screen.height * 0.8).round().max(600.0);
+                        // 与屏幕同比例:宽高都取屏幕 80%,窗口形状跟屏幕一致。
+                        let width = (screen.width * 0.8).round().max(960.0);
+                        let height = (screen.height * 0.8).round().max(600.0);
 
-                    // 手动算居中坐标(origin + (屏 - 窗)/2),不依赖 win.center() ——
-                    // center() 在多屏/Overlay 标题栏下有时不按本屏工作区算,会偏。
-                    let x = origin.x + (screen.width - width) / 2.0;
-                    let y = origin.y + (screen.height - height) / 2.0;
+                        // 手动算居中坐标(origin + (屏 - 窗)/2),不依赖 win.center() ——
+                        // center() 在多屏/Overlay 标题栏下有时不按本屏工作区算,会偏。
+                        let x = origin.x + (screen.width - width) / 2.0;
+                        let y = origin.y + (screen.height - height) / 2.0;
 
-                    let _ = win.set_size(LogicalSize::new(width, height));
-                    let _ = win.set_position(LogicalPosition::new(x, y));
+                        let _ = win.set_size(LogicalSize::new(width, height));
+                        let _ = win.set_position(LogicalPosition::new(x, y));
+                    }
                 }
                 // 无论是否拿到 monitor(读不到就用兜底尺寸)都要 show,否则窗口永久隐藏。
                 let _ = win.show();
+
+                // 关窗时保存几何。强杀进程会丢这一次的调整,可接受。
+                let win_for_save = win.clone();
+                win.on_window_event(move |ev| {
+                    if let tauri::WindowEvent::CloseRequested { .. } = ev {
+                        save_main_window_geometry(&win_for_save);
+                    }
+                });
+            }
+
+            #[cfg(desktop)]
+            setup_tray(app)?;
+
+            // 预览更新弹窗(设计走查/自测):TP_PREVIEW_UPDATER=1 启动即弹,不依赖网络。
+            if std::env::var_os("TP_PREVIEW_UPDATER").is_some() {
+                let _ = updater_ui::preview_dialog(&app.handle().clone());
             }
 
             // 启动后台静默检查更新。endpoint(GitHub Release latest.json)+ pubkey 在
@@ -356,7 +506,7 @@ pub fn run() {
             // serde_json 序列化成 JS 字面量,安全转义防注入。
             let api_base = config::resolve_api_base();
             if let Ok(lit) = serde_json::to_string(&api_base) {
-                let _ = webview.eval(&format!("window.__TP_API_BASE__ = {lit};"));
+                let _ = webview.eval(format!("window.__TP_API_BASE__ = {lit};"));
             }
             // 注入客户端运行环境给前端(window.__TP_CLIENT_INFO__):版本号(编译期 Cargo
             // 版本)+ OS。前端给每个云端请求带 X-Talon-Client* header,后端按此识别客户端、
@@ -366,7 +516,7 @@ pub fn run() {
                 "os": std::env::consts::OS,  // macos / windows / linux
             });
             if let Ok(lit) = serde_json::to_string(&client_info) {
-                let _ = webview.eval(&format!("window.__TP_CLIENT_INFO__ = {lit};"));
+                let _ = webview.eval(format!("window.__TP_CLIENT_INFO__ = {lit};"));
             }
             // 拖动条只 macOS 需要(Overlay 透明标题栏无原生可拖区)。
             // Windows/Linux 用系统原生标题栏,直接可拖,不注入。
@@ -375,6 +525,17 @@ pub fn run() {
                 let _ = webview.eval(TITLEBAR_DRAG_SCRIPT);
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // 退出前存窗口几何。窗口的 CloseRequested 只覆盖「点红钮关窗」;
+            // macOS Cmd+Q / 托盘退出 / app.exit 不经过它(实测),都汇聚到这里。
+            // 窗口已销毁时 outer_position 会失败,save 内部静默跳过,不会覆盖坏值。
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                use tauri::Manager;
+                if let Some(win) = app.get_webview_window("main") {
+                    save_main_window_geometry(&win);
+                }
+            }
+        });
 }
