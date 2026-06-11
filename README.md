@@ -45,6 +45,8 @@
 
 > 应用还在持续更新中。升级方式：到 [Releases](https://github.com/darkmice/talon-pilot-studio/releases) 下载新版覆盖安装。
 
+> 维护者发版流程见 [docs/RELEASING.md](docs/RELEASING.md)。
+
 ## 高级配置（可选）
 
 配置文件：macOS/Linux `~/.config/talon-pilot-studio/config.toml`，Windows `%APPDATA%\talon-pilot-studio\config.toml`。
