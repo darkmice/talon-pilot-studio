@@ -96,6 +96,56 @@ fn agent_restart() -> Result<agent::AgentStatus, String> {
     agent::restart_daemon()
 }
 
+/// 弹系统「选择文件夹」对话框,返回选中目录的绝对路径(取消则 None)。
+/// 给本地项目创建向导用,替代手填绝对路径。
+/// (async):blocking_pick_folder 会把原生面板派发到主线程并阻塞调用线程,
+/// 必须在 worker 线程上调(非 async 命令在主线程跑会死锁)。
+#[tauri::command(async)]
+fn pick_folder(app: tauri::AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .set_title("选择项目文件夹")
+        .blocking_pick_folder()
+        .and_then(|fp| fp.into_path().ok())
+        .map(|p| p.display().to_string())
+}
+
+/// 用系统默认浏览器打开外链。仅允许 http/https —— 防前端被诱导打开 file:// 或
+/// 任意 scheme(可能触发本地处理器)。
+#[tauri::command(async)]
+fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("拒绝打开非 http(s) 链接: {url}"));
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// 在系统文件管理器中定位(选中)某个文件/目录(「在 Finder 中显示」)。
+#[tauri::command(async)]
+fn reveal_in_dir(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|e| e.to_string())
+}
+
+/// 弹原生系统通知(任务完成/需要验收等)。best-effort:未授权/失败返回 Err,
+/// 前端忽略即可(通知失败不该影响主流程)。
+#[tauri::command(async)]
+fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|e| e.to_string())
+}
+
 /// WebView 完整 OAuth 登录闭环：spawn `tp-agent login --suppress-browser --print-auth-url`，
 /// 流式拿到授权 URL 后在新 WebView 窗口打开，tp-agent 自己的 loopback callback 完成授权 +
 /// self-enroll，进程退出后返回 enrolled 状态。无需用户手抄 api_key。
@@ -415,6 +465,10 @@ pub fn run() {
             agent_start,
             agent_stop,
             agent_restart,
+            pick_folder,
+            open_external,
+            reveal_in_dir,
+            notify,
             app_check_update
         ])
         .setup(|app| {
