@@ -15,21 +15,29 @@ name: Release (multi-platform, unsigned)
 # 可复现:talon-pilot / talon-ui 按仓库根 repos.lock 锁定的 ref checkout(发版前
 # 应锁成 commit SHA);workflow_dispatch 的 inputs 可临时覆盖。
 #
-# 签名:无 Apple / Windows 证书 → 产**未签名**安装包。
-#   - macOS: ad-hoc 自签(tauri.conf signingIdentity "-");首开右键→打开 绕 Gatekeeper
-#   - Windows: 未签名 .msi/.exe;SmartScreen 可能提示,选「仍要运行」
-#   - Linux: .deb / .AppImage 无需签名
+# 签名:
+#   - macOS: 配齐 Apple secrets(见下)→ Developer ID 签名 + Apple 公证 + staple,
+#     用户下载直接打开无警告;未配置则 ad-hoc 自签(首开右键→打开 绕 Gatekeeper)。
+#   - Windows: 未签名 .msi/.exe;SmartScreen 可能提示,选「仍要运行」。
+#   - Linux: .deb / .AppImage 无需签名。
 #
-# 自动更新(无 Apple 证书也可用):updater 用**自有 minisign 密钥**校验更新包完整性,
-# 与 Apple 代码签名是两码事。app 自下载替换自身不打 quarantine 标记 → 绕过 Gatekeeper
-# 重校(只首次浏览器下载会被拦)。build 时注入 TAURI_SIGNING_PRIVATE_KEY 产 .sig,
-# release job 据 .sig 生成 latest.json,客户端启动时拉 endpoint 比对版本。
+# 自动更新(独立于 Apple 签名):updater 用**自有 minisign 密钥**校验更新包完整性。
+# build 时注入 TAURI_SIGNING_PRIVATE_KEY 产 .sig,release job 据 .sig 生成 latest.json,
+# 客户端启动时拉 endpoint 比对版本。开了 Apple 签名后,更新包内的 .app 也是签名+公证的,
+# 自更新替换后仍受 Gatekeeper 信任。
 #
 # 需要的 Secret:
 #   TALON_PILOT_PAT          —— fine-grained PAT, 对 darkmice/talon-pilot 有 Contents:Read,
 #                               用来 checkout private 的 talon-pilot 仓(web-next 前端源)。
 #   TAURI_SIGNING_PRIVATE_KEY —— `tauri signer generate` 生成的 minisign 私钥(无密码),
 #                               公钥已写进 tauri.conf.json plugins.updater.pubkey。
+#   ── 以下为 macOS Apple 签名+公证(全部可选;缺则产未签名包,不影响构建)──
+#   APPLE_CERTIFICATE          —— Developer ID Application 证书导出的 .p12 的 base64。
+#   APPLE_CERTIFICATE_PASSWORD —— 导出 .p12 时设的密码。
+#   APPLE_SIGNING_IDENTITY     —— 形如 "Developer ID Application: Watusi LLC (35N673QYJ7)"。
+#   APPLE_API_ISSUER           —— App Store Connect API Key 的 Issuer ID(UUID)。
+#   APPLE_API_KEY_ID           —— 该 API Key 的 Key ID(10 位)。
+#   APPLE_API_KEY_P8           —— 该 API Key 的 AuthKey_*.p8 文件的 base64(公证用)。
 
 on:
   push:
@@ -206,6 +214,29 @@ jobs:
         shell: bash
         run: rm -rf "src-tauri/target/${{ matrix.rust_target }}/release/bundle" || true
 
+      # macOS Apple 签名+公证准备(仅 macOS,且配齐 secrets 时):
+      #   - 把 App Store Connect API Key(.p8 的 base64)写成文件,导出 APPLE_API_KEY_PATH;
+      #   - 把真实 Developer ID 签名身份写进 tauri.conf.json(覆盖默认 "-" ad-hoc),
+      #     避免 env 与 config 优先级歧义。
+      # secrets 缺失(fork / 未配置)时本步 no-op,Tauri build 退回 ad-hoc 未签名 —— 不破坏现有流程。
+      - name: Prepare macOS signing & notarization
+        if: startsWith(matrix.runner, 'macos')
+        working-directory: repos/talon-pilot-studio
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "未配置 Apple 签名 secrets —— 跳过,产 ad-hoc 未签名包(现有行为)。"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/notary"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary/AuthKey.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/notary/AuthKey.p8" >> "$GITHUB_ENV"
+          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.bundle.macOS=c.bundle.macOS||{};c.bundle.macOS.signingIdentity=process.env.APPLE_SIGNING_IDENTITY;fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');console.log('signingIdentity =>',c.bundle.macOS.signingIdentity);"
+
       - name: Tauri build
         working-directory: repos/talon-pilot-studio
         env:
@@ -214,6 +245,14 @@ jobs:
           # 及其 .sig 签名文件;app 自更新时用 tauri.conf pubkey 校验这些 .sig。
           # 私钥无密码生成,故不需要 TAURI_SIGNING_PRIVATE_KEY_PASSWORD。
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # macOS Apple 签名+公证(其余平台忽略这些 env)。配齐 secrets 时:
+          #   APPLE_CERTIFICATE(+PASSWORD)→ Tauri 临时钥匙串导入 .p12 并签名;
+          #   APPLE_API_ISSUER/APPLE_API_KEY(Key ID)/APPLE_API_KEY_PATH → notarytool 公证 + staple。
+          # secrets 缺失时这些为空,Tauri 跳过签名/公证 → ad-hoc 未签名(现有行为)。
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
         run: pnpm tauri build --target ${{ matrix.rust_target }}
 
       # ── 7. 收集产物(各平台 bundle 类型不同) ───────────────────────────

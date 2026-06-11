@@ -13,7 +13,25 @@
 | `TALON_PILOT_PAT` | fine-grained PAT，对 `darkmice/talon-pilot` 有 Contents:Read，用来 checkout 私有的 web-next 前端源 |
 | `TAURI_SIGNING_PRIVATE_KEY` | `tauri signer generate` 生成的 minisign 私钥（无密码）。公钥已写进 `tauri.conf.json` 的 `plugins.updater.pubkey`，**不可更换**，否则老客户端无法校验新包 |
 
-> 这两个 Secret 缺任意一个，发版流水线会失败（前者 checkout 报错，后者收集不到 `.sig` 会主动 `exit 1`）。
+> 上面两个 Secret 缺任意一个，发版流水线会失败（前者 checkout 报错，后者收集不到 `.sig` 会主动 `exit 1`）。
+
+### macOS Apple 签名 + 公证（可选）
+
+配齐下面这组 Secret 后，macOS 产物会用 **Developer ID** 签名、经 Apple **公证(notarize)** 并 staple，
+用户下载直接打开无「无法验证开发者」警告。**全部缺失时退回 ad-hoc 未签名**（首开右键→打开），不影响构建。
+
+| Secret | 怎么拿 |
+|---|---|
+| `APPLE_CERTIFICATE` | 钥匙串导出 Developer ID Application 证书（含私钥）为 `.p12`，再 `base64 -i cert.p12 \| pbcopy` |
+| `APPLE_CERTIFICATE_PASSWORD` | 导出 `.p12` 时设的密码 |
+| `APPLE_SIGNING_IDENTITY` | `security find-identity -v -p codesigning` 里那条，形如 `Developer ID Application: Watusi LLC (35N673QYJ7)` |
+| `APPLE_API_ISSUER` | App Store Connect → 用户和访问 → 集成/密钥 → App Store Connect API，页面顶部的 **Issuer ID**（UUID） |
+| `APPLE_API_KEY_ID` | 同页生成一个 API Key，它的 **Key ID**（10 位） |
+| `APPLE_API_KEY_P8` | 生成 API Key 时**只能下载一次**的 `AuthKey_XXXX.p8`，`base64 -i AuthKey_XXXX.p8 \| pbcopy` |
+
+> - Developer ID 证书只有 **Account Holder** 能创建；App Store Connect API Key 需 **Admin/Account Holder** 权限。没权限就用 Apple ID + App 专用密码方案（改 release.yml 的公证 env 为 `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID`）。
+> - 证书私钥与 `.p12` 是敏感材料,只放 GitHub Secret,别提交进仓库。
+> - 公证偶发因 entitlements/hardened-runtime 失败,届时按 notarytool 日志补 entitlements。
 
 ---
 
