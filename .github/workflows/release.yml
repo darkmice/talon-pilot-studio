@@ -249,7 +249,28 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: pnpm tauri build --target ${{ matrix.rust_target }}
+        # 带重试:macOS Developer ID 签名要向 timestamp.apple.com 取安全时间戳、公证要连
+        # Apple notary,这俩偶发抖动(报 "A timestamp was expected but was not found" /
+        # 公证超时)。编译有 cargo 缓存,重试只重跑打包+签名+公证,很快,能自愈瞬时网络失败。
+        shell: bash
+        run: |
+          set -u
+          target="${{ matrix.rust_target }}"
+          max=3
+          attempt=0
+          while :; do
+            attempt=$((attempt+1))
+            echo "=== tauri build 尝试 $attempt/$max (target=$target) ==="
+            if pnpm tauri build --target "$target"; then
+              echo "✓ build 成功"; break
+            fi
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::tauri build 重试 $max 次仍失败"; exit 1
+            fi
+            echo "build 失败(常见为 Apple 时间戳/公证服务器抖动),清 bundle 后重试…"
+            rm -rf "src-tauri/target/$target/release/bundle" || true
+            sleep 20
+          done
 
       # ── 7. 收集产物(各平台 bundle 类型不同) ───────────────────────────
       #   macOS: .dmg | Windows: .msi/.exe(nsis) | Linux: .deb/.AppImage
