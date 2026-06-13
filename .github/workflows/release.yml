@@ -65,7 +65,10 @@ jobs:
   build:
     name: build (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # 1h 兜底 → 120min。macOS 公证偶发 hang(2026-06-11 实测 47min 没返回),
+    # 配合下方 25min/次 retry 超时,3 次 retry 上限 ~75min,留 45min 余量给
+    # 编译 / 签名 / 上传。其他平台仍跑 ~10min,timeout 抬高不影响计费。
+    timeout-minutes: 120
     strategy:
       fail-fast: false # 一个平台挂不连累其它平台
       matrix:
@@ -249,25 +252,65 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        # 带重试:macOS Developer ID 签名要向 timestamp.apple.com 取安全时间戳、公证要连
-        # Apple notary,这俩偶发抖动(报 "A timestamp was expected but was not found" /
-        # 公证超时)。编译有 cargo 缓存,重试只重跑打包+签名+公证,很快,能自愈瞬时网络失败。
+        # 带重试 + 单次硬超时:macOS Developer ID 签名要向 timestamp.apple.com 取安全
+        # 时间戳、公证要连 Apple notary。这俩偶发抖动(报 "A timestamp was expected but
+        # was not found" / 公证超时);更严重的是 tauri-bundler 调 `xcrun notarytool submit
+        # --wait` 没 timeout 选项,Apple notary 服务卡时整个 build 会 hang 死(2026-06-11
+        # 实测 47min 没返回)。编译有 cargo 缓存,重试只重跑打包+签名+公证,很快。
+        #
+        # `timeout 1500` = 25 分钟单次硬超时。Apple notarize 正常 5-15min,异常 20-30min;
+        # 超过 25min 几乎可以认定为服务侧 hang,kill 重试比死等更快。
+        # SIGTERM(默认)给 10s 优雅退出窗口,然后 SIGKILL(--kill-after=10)。
+        # 退出码:超时 = 124,非 0 都走 retry 分支。
         shell: bash
         run: |
           set -u
           target="${{ matrix.rust_target }}"
           max=3
           attempt=0
+          # 选择 timeout 命令:GNU coreutils 在 macOS 是 gtimeout(runner 预装),
+          # Linux 是 timeout;都没找到时退回 bash 后台监视器实现。
+          if command -v timeout >/dev/null 2>&1; then
+            TO=(timeout --kill-after=10 1500)
+          elif command -v gtimeout >/dev/null 2>&1; then
+            TO=(gtimeout --kill-after=10 1500)
+          else
+            # bash fallback:后台跑 + sleep + kill
+            TO=()
+            echo "::notice::timeout/gtimeout 不可用,使用 bash 后台监视器(精度差但能用)"
+          fi
+
+          run_with_timeout() {
+            if [ "${#TO[@]}" -gt 0 ]; then
+              "${TO[@]}" "$@"
+              return $?
+            fi
+            # bash 实现:子进程跑命令,后台 sleep 监视,先到先杀
+            "$@" &
+            local pid=$!
+            ( sleep 1500 && kill -TERM "$pid" 2>/dev/null && sleep 10 && kill -KILL "$pid" 2>/dev/null ) &
+            local watcher=$!
+            local rc=0
+            wait "$pid" 2>/dev/null || rc=$?
+            kill "$watcher" 2>/dev/null || true
+            return $rc
+          }
+
           while :; do
             attempt=$((attempt+1))
-            echo "=== tauri build 尝试 $attempt/$max (target=$target) ==="
-            if pnpm tauri build --target "$target"; then
+            echo "=== tauri build 尝试 $attempt/$max (target=$target,单次硬超时 25min) ==="
+            if run_with_timeout pnpm tauri build --target "$target"; then
               echo "✓ build 成功"; break
             fi
-            if [ "$attempt" -ge "$max" ]; then
-              echo "::error::tauri build 重试 $max 次仍失败"; exit 1
+            rc=$?
+            if [ "$rc" = "124" ] || [ "$rc" = "137" ] || [ "$rc" = "143" ]; then
+              echo "::warning::tauri build 第 $attempt 次超时(25min),很可能 Apple notarize hang;清 bundle 重试"
+            else
+              echo "::warning::tauri build 第 $attempt 次失败(rc=$rc),清 bundle 重试"
             fi
-            echo "build 失败(常见为 Apple 时间戳/公证服务器抖动),清 bundle 后重试…"
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::tauri build 重试 $max 次仍失败 / 超时"; exit 1
+            fi
             rm -rf "src-tauri/target/$target/release/bundle" || true
             sleep 20
           done
