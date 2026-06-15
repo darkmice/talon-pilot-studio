@@ -6,5 +6,8 @@
 # 用法:
 #   - 日常可以填分支名(跟最新),发正式版前应锁成具体 commit SHA;
 #   - workflow_dispatch 手动跑时可用 inputs 临时覆盖,不用改文件。
-talon_pilot_ref = "main"
-talon_ui_ref = "main"
+# 0.1.8 发版锁定(2026-06-15):锁成具体 commit SHA,保证同 tag 重跑打出一致前端。
+# 两个 SHA 都必须在 darkmice 上(studio CI 从 darkmice checkout,不是 x.xgit 镜像)。
+# talon_pilot = 本轮全部改动(目录占用引导/内置同事真名/joined_by/deploy 修复/workspace bump)。
+talon_pilot_ref = "b84f1a3ff99d57449b0cb6569f02ed9c9e300b41"
+talon_ui_ref = "13cfd1f95fcf4649139c0a5d67ac840f88e34d0e"
