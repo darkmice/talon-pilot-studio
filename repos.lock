@@ -6,8 +6,9 @@
 # 用法:
 #   - 日常可以填分支名(跟最新),发正式版前应锁成具体 commit SHA;
 #   - workflow_dispatch 手动跑时可用 inputs 临时覆盖,不用改文件。
-# 0.1.9 发版锁定(2026-06-17):锁成具体 commit SHA,保证同 tag 重跑打出一致前端。
+# 0.1.10 发版锁定(2026-06-18):锁成具体 commit SHA,保证同 tag 重跑打出一致前端。
 # 两个 SHA 都必须在 darkmice 上(studio CI 从 darkmice checkout,不是 x.xgit 镜像)。
-# talon_pilot = dd758a19:执行节点可升级红点 + 运营后台 tp-agent 版本设定面板 + 之前累积改动。
-talon_pilot_ref = "dd758a196f2f5b1cdecd91d83598de0a91014e92"
+# talon_pilot = bcfc05cb:项目「已归档」独立筛选 + 撤销节点确认框修复 + ui.confirm 默认焦点 +
+#   侧栏弹层裁切/重影修复 + 归档提示文案对齐 + (累积:红点/运营版本面板)。
+talon_pilot_ref = "bcfc05cb76d711ffa8bb3e8b1e4c4270dcd48a54"
 talon_ui_ref = "13cfd1f95fcf4649139c0a5d67ac840f88e34d0e"
