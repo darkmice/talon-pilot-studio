@@ -1,4 +1,5 @@
 mod agent;
+mod browser;
 mod config;
 mod updater_ui;
 mod window_state;
@@ -42,6 +43,27 @@ fn agent_login_cancel() {
 #[tauri::command(async)]
 fn agent_status() -> Result<agent::AgentStatus, String> {
     agent::fetch_status()
+}
+
+/// 「浏览器」连接器状态:relay 在线 / 扩展已连 / 已铺扩展目录(供 web 连接器显示)。
+#[tauri::command(async)]
+fn browser_connector_status(app: tauri::AppHandle) -> Result<browser::BrowserConnectorStatus, String> {
+    Ok(browser::status(browser::extension_target_dir(&app)))
+}
+
+/// 开/关浏览器连接器:开 = 铺扩展 + 装 native host + 起 relay;关 = 停 relay 开关。
+#[tauri::command(async)]
+fn browser_connector_set_enabled(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<browser::BrowserConnectorStatus, String> {
+    browser::set_enabled(&app, enabled)
+}
+
+/// 在 Chrome 打开 chrome://extensions(供安装引导)。
+#[tauri::command(async)]
+fn open_chrome_extensions_page() -> Result<(), String> {
+    browser::open_chrome_extensions_page()
 }
 
 /// 帮装 tp-agent(跨平台,从配置镜像 / GitHub Release 下载)。返回安装路径。
@@ -469,6 +491,9 @@ pub fn run() {
             open_external,
             reveal_in_dir,
             notify,
+            browser_connector_status,
+            browser_connector_set_enabled,
+            open_chrome_extensions_page,
             app_check_update
         ])
         .setup(|app| {
