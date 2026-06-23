@@ -6,9 +6,12 @@
 # 用法:
 #   - 日常可以填分支名(跟最新),发正式版前应锁成具体 commit SHA;
 #   - workflow_dispatch 手动跑时可用 inputs 临时覆盖,不用改文件。
-# 0.1.10 发版锁定(2026-06-18):锁成具体 commit SHA,保证同 tag 重跑打出一致前端。
+# 0.1.11 发版锁定(2026-06-23):锁成具体 commit SHA,保证同 tag 重跑打出一致前端。
 # 两个 SHA 都必须在 darkmice 上(studio CI 从 darkmice checkout,不是 x.xgit 镜像)。
-# talon_pilot = bcfc05cb:项目「已归档」独立筛选 + 撤销节点确认框修复 + ui.confirm 默认焦点 +
-#   侧栏弹层裁切/重影修复 + 归档提示文案对齐 + (累积:红点/运营版本面板)。
-talon_pilot_ref = "bcfc05cb76d711ffa8bb3e8b1e4c4270dcd48a54"
-talon_ui_ref = "13cfd1f95fcf4649139c0a5d67ac840f88e34d0e"
+# talon_pilot = a69e2a1e:在 bcfc05cb(0.1.10)基础上追上 06-19~06-23 全部 web 特性 ——
+#   普通群聊(@员工转普通群)+ 公共 MentionTextEditor + 附件 lightbox + 重连流式 partial +
+#   邮箱+密码登录(第三方式)+ 验证码/OAuth 改密免旧密码 + 设置弹窗 + 模式选择器(设计含
+#   logo / 办公接管)+ TalonBlock 前端组件层。
+# talon_ui = 702b16cf:Portal 显式挂 body 修 transform 祖先下弹窗不居中(0.1.10 后的 modal 修复)。
+talon_pilot_ref = "a69e2a1e8e1ce83aea2f4d6193c162a31a65ed70"
+talon_ui_ref = "702b16cfdd869625a228a6cdd424b909697e0e5f"
